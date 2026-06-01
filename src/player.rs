@@ -1069,17 +1069,39 @@ impl Player {
             forward.z as f64,
         );
 
-        let step_size = 0.1;
+        // Fine fixed-step ray march. The ring transform is curved and per-axis
+        // scaled, so a true voxel-DDA in world space is awkward; instead we step
+        // finely (small fraction of a voxel) in world space, convert each sample
+        // to its GLOBAL voxel cell, and stop at the first solid voxel. The face
+        // normal is taken from the LAST AIR cell the ray occupied before the hit
+        // (the face it entered through), expressed in LOCAL voxel axes
+        // (x=ring, y=height, z=width) so it matches placement/highlight.
+        //
+        // The previous version stepped 0.1 world units and derived the normal
+        // from the delta between consecutive *floored chunk-local* cells, which
+        // (a) could skip a thin voxel and (b) produced a wrong/al­iased normal at
+        // chunk boundaries — making the selection box jump to the wrong block.
+        let step_size = 0.02;
         let max_steps = (RAYCAST_MAX_DISTANCE as f64 / step_size) as usize;
 
-        let mut prev_ring_pos: Option<(u32, u32, u32, ChunkCoord)> = None;
+        // Track the previous sample's GLOBAL voxel cell (across chunk borders).
+        // Global cell = (chunk_index * chunk_size + local) per axis.
+        let cs = config.chunk_size as i32;
+        let to_global = |coord: &ChunkCoord, lx: i32, ly: i32, lz: i32| -> (i32, i32, i32) {
+            (
+                coord.ring_index as i32 * cs + lx,
+                coord.height_index as i32 * cs + ly,
+                coord.width_index as i32 * cs + lz,
+            )
+        };
+
+        let mut prev_global: Option<(i32, i32, i32)> = None;
 
         for i in 0..max_steps {
             let t = i as f64 * step_size;
             let world_pos = origin + direction * t;
 
             let ring_pos = RingPosition::from_cartesian(world_pos, config);
-            
             if !ring_pos.is_valid(config) {
                 continue;
             }
@@ -1096,36 +1118,48 @@ impl Player {
             let ly = local_height.floor() as i32;
             let lz = local_y.floor() as i32;
 
-            if lx < 0 || ly < 0 || lz < 0 || lx >= config.chunk_size as i32 || ly >= config.chunk_size as i32 || lz >= config.chunk_size as i32 {
+            if lx < 0 || ly < 0 || lz < 0
+                || lx >= cs || ly >= cs || lz >= cs
+            {
                 continue;
             }
 
-            let lx = lx as u32;
-            let ly = ly as u32;
-            let lz = lz as u32;
+            let cur_global = to_global(&chunk_coord, lx, ly, lz);
+            // Don't re-test the same global cell twice (fine stepping revisits).
+            if prev_global == Some(cur_global) {
+                continue;
+            }
 
             if let Some(chunk) = chunk_manager.get_chunk(&chunk_coord) {
-                let voxel = chunk.get_voxel(lx, ly, lz);
+                let voxel = chunk.get_voxel(lx as u32, ly as u32, lz as u32);
                 if voxel.voxel_type != VoxelType::Air && voxel.voxel_type != VoxelType::Water {
-                    let normal = if let Some((px, py, pz, _prev_coord)) = prev_ring_pos {
-                        let dx = lx as i32 - px as i32;
-                        let dy = ly as i32 - py as i32;
-                        let dz = lz as i32 - pz as i32;
-                        [-dx.signum(), -dy.signum(), -dz.signum()]
+                    // Face normal = direction from the hit cell back to the last
+                    // cell the ray was in (the face it entered through), in local
+                    // voxel axes. Falls back to +Y if we started inside.
+                    let normal = if let Some((pgx, pgy, pgz)) = prev_global {
+                        let (hgx, hgy, hgz) = cur_global;
+                        [
+                            (pgx - hgx).signum(),
+                            (pgy - hgy).signum(),
+                            (pgz - hgz).signum(),
+                        ]
                     } else {
                         [0, 1, 0]
                     };
 
                     return Some(RaycastHit {
                         chunk_coord,
-                        local_x: lx,
-                        local_y: ly,
-                        local_z: lz,
+                        local_x: lx as u32,
+                        local_y: ly as u32,
+                        local_z: lz as u32,
                         normal,
                     });
                 }
-
-                prev_ring_pos = Some((lx, ly, lz, chunk_coord));
+                prev_global = Some(cur_global);
+            } else {
+                // Even if the chunk isn't loaded, remember the cell so the
+                // entry-face normal stays correct once we cross into a loaded one.
+                prev_global = Some(cur_global);
             }
         }
 

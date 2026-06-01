@@ -47,6 +47,12 @@ struct ChunkMesh {
     center: [f32; 3],
     /// Whether this mesh is non-empty (used for occlusion culling).
     non_empty: bool,
+    /// Whether this cached GPU mesh was built with the LOD (low-detail) mesher
+    /// (true) or the full-resolution mesher (false). Compared against the
+    /// chunk's CURRENT desired LOD level each frame so a chunk re-meshes when
+    /// the player crosses the LOD distance boundary (fixes "valley faces missing
+    /// until I edit a block").
+    meshed_as_lod: bool,
 }
 
 /// A view frustum defined by its 6 clipping planes, extracted from a
@@ -805,6 +811,16 @@ impl State {
         }
     }
 
+    /// Toggle greedy meshing on/off (F7 A/B test) and force ALL loaded chunks to
+    /// re-mesh so the change takes effect immediately. With greedy OFF, the
+    /// mesher emits every visible block face as its own 1x1 quad (no merging).
+    pub fn toggle_greedy_mesh(&mut self) {
+        self.enable_greedy_mesh = !self.enable_greedy_mesh;
+        for (_, chunk) in self.chunk_manager.chunks.iter_mut() {
+            chunk.dirty = true;
+        }
+    }
+
     /// Destroy the block the player is looking at
     pub fn destroy_block(&mut self) -> bool {
         self.player.destroy_block(&self.ring_config, &mut self.chunk_manager)
@@ -939,6 +955,34 @@ impl State {
         // ---- Task 5: Multithreaded chunk generation (rayon) ----
         self.generate_pending_chunks();
 
+        // ---- LOD transition re-mesh ----
+        // A chunk is meshed as LOD (low detail) when its distance > 7, else
+        // full-resolution. But a chunk only re-meshes when `dirty`, and moving
+        // the player across the distance-7 boundary does NOT by itself set the
+        // flag. So a chunk meshed at low detail when far stays low-detail up
+        // close — and the LOD mesher legitimately produces different (coarser)
+        // geometry that drops faces on uneven valley/cliff terrain. The result
+        // was "valley walls missing until I break a block" (breaking forces a
+        // re-mesh). Here we compare each chunk's CURRENT desired LOD level
+        // against what its cached GPU mesh was actually built with, and mark any
+        // mismatch dirty so it re-meshes at the correct detail.
+        {
+            let player_pos = self.player.ring_position;
+            let mut to_dirty: Vec<ChunkCoord> = Vec::new();
+            for (coord, mesh) in self.chunk_meshes.iter() {
+                let dist = self.chunk_manager.chunk_distance(coord, &player_pos);
+                let want_lod = dist > 7;
+                if mesh.meshed_as_lod != want_lod {
+                    to_dirty.push(*coord);
+                }
+            }
+            for coord in to_dirty {
+                if let Some(chunk) = self.chunk_manager.chunks.get_mut(&coord) {
+                    chunk.dirty = true;
+                }
+            }
+        }
+
         // ---- Determine which chunks are dirty and need a mesh rebuild ----
         let dirty_coords: Vec<ChunkCoord> = self
             .chunk_manager
@@ -961,12 +1005,13 @@ impl State {
             let chunk_manager = &self.chunk_manager;
             let chunks = &self.chunk_manager.chunks;
             let player_pos = self.player.ring_position;
+            let greedy = self.enable_greedy_mesh;
 
             // ---- Task 6: Multithreaded mesh building (rayon) ----
             // Each task reads its chunk + 6 neighbors (all immutable borrows) and
             // produces a vertex/index buffer plus the LOD flag used for it.
             // ---- Task 4: LOD selection (chunks beyond distance 5 use the LOD mesh) ----
-            let built: Vec<(ChunkCoord, ChunkMeshData)> = dirty_coords
+            let built: Vec<(ChunkCoord, ChunkMeshData, bool)> = dirty_coords
                 .par_iter()
                 .map(|coord| {
                     let coord = *coord;
@@ -995,19 +1040,24 @@ impl State {
                     // shell.) The LOD mesher is lower fidelity and, even with the
                     // full-solid occlusion fix, is best reserved for far chunks.
                     let dist = chunk_manager.chunk_distance(&coord, &player_pos);
-                    let mesh = if dist > 7 {
+                    let is_lod = dist > 7;
+                    let mesh = if is_lod {
                         chunk.generate_lod_mesh_split(&neighbors)
-                    } else {
+                    } else if greedy {
                         chunk.generate_mesh_split(&neighbors)
+                    } else {
+                        // F7 A/B test: non-greedy meshing emits every visible
+                        // face as its own quad (no merging).
+                        chunk.generate_mesh_split_no_greedy(&neighbors)
                     };
-                    (coord, mesh)
+                    (coord, mesh, is_lod)
                 })
                 .collect();
 
             // ---- Task 7: Chunk mesh caching ----
             // Now that meshes are built, increment each chunk's mesh_version and
             // clear its dirty flag (main thread), then upload to the GPU.
-            for (coord, mesh) in built {
+            for (coord, mesh, is_lod) in built {
                 let new_version = {
                     let chunk = self.chunk_manager.chunks.get_mut(&coord).unwrap();
                     chunk.dirty = false;
@@ -1117,6 +1167,7 @@ impl State {
                         mesh_version: new_version,
                         center,
                         non_empty: true,
+                        meshed_as_lod: is_lod,
                     },
                 );
             }

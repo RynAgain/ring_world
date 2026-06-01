@@ -357,6 +357,76 @@ impl Chunk {
         }
     }
 
+    /// Non-greedy variant of [`generate_mesh_split`]: emits EVERY visible block
+    /// face as its own 1x1 quad with no merging. Used by the F7 A/B-test toggle
+    /// to determine whether the greedy merge step is responsible for dropped
+    /// faces. Visibility / culling / texturing / lighting are identical to the
+    /// greedy path; only the merge is removed.
+    pub fn generate_mesh_split_no_greedy(
+        &self,
+        neighbors: &[Option<&Chunk>; 6],
+    ) -> ChunkMeshData {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut water_vertices = Vec::new();
+        let mut water_indices = Vec::new();
+        let size = self.size;
+
+        for face_dir in 0..6u8 {
+            let face = Face::from_index(face_dir);
+            for d in 0..size {
+                for v in 0..size {
+                    for u in 0..size {
+                        let (x, y, z) = face.map_coords(d, u, v);
+                        let voxel = self.get_voxel(x, y, z);
+                        if voxel.is_air() { continue; }
+                        if is_cross_render(voxel.voxel_type) { continue; }
+                        if !self.is_face_visible(x, y, z, face, size, neighbors) { continue; }
+
+                        let face_dir_enum = match face {
+                            Face::PosY => FaceDir::Top,
+                            Face::NegY => FaceDir::Bottom,
+                            _ => FaceDir::Side,
+                        };
+                        let tex_idx = texture::texture_index(voxel.voxel_type, face_dir_enum);
+                        let light = self.face_light_factor(x, y, z, face, neighbors);
+                        let color = face_tint(voxel.voxel_type, face_dir_enum);
+                        let (vbuf, ibuf) = if is_translucent(voxel.voxel_type) {
+                            (&mut water_vertices, &mut water_indices)
+                        } else {
+                            (&mut vertices, &mut indices)
+                        };
+                        // width = height = 1: one quad per face cell.
+                        add_greedy_quad(vbuf, ibuf, face, d, u, v, 1, 1, tex_idx, light, color, is_alpha_tested(voxel.voxel_type));
+                    }
+                }
+            }
+        }
+
+        // Cross-render decorations (same as the greedy path).
+        for z in 0..size {
+            for y in 0..size {
+                for x in 0..size {
+                    let voxel = self.get_voxel(x, y, z);
+                    if voxel.is_air() { continue; }
+                    if !is_cross_render(voxel.voxel_type) { continue; }
+                    let tex_idx = texture::texture_index(voxel.voxel_type, FaceDir::Side);
+                    let (sun, block) = self.get_light(x, y, z);
+                    let light = ((sun.max(block) as f32) / 15.0).max(MIN_LIGHT_FACTOR);
+                    let color = face_tint(voxel.voxel_type, FaceDir::Side);
+                    add_cross_quads(&mut vertices, &mut indices, x, y, z, tex_idx, light, color, is_alpha_tested(voxel.voxel_type));
+                }
+            }
+        }
+
+        ChunkMeshData {
+            opaque_vertices: vertices,
+            opaque_indices: indices,
+            water_vertices,
+            water_indices,
+        }
+    }
+
     /// Sample a 2x2x2 block of voxels at block-grid coordinates (bx, by, bz)
     /// (each ranges over 0..size/step). Returns the most representative solid
     /// (non-air) voxel type in the block, or None if the whole block is air.

@@ -146,6 +146,13 @@ fn main() {
                             (KeyCode::F6, ElementState::Pressed) => {
                                 state.debug_render = !state.debug_render;
                             }
+                            // Toggle greedy meshing (F7): re-meshes ALL loaded
+                            // chunks. With greedy OFF every block face is emitted
+                            // as its own 1x1 quad (no merging), which is the A/B
+                            // test for "is the greedy merge dropping faces?".
+                            (KeyCode::F7, ElementState::Pressed) => {
+                                state.toggle_greedy_mesh();
+                            }
                             // Toggle borderless fullscreen (F11)
                             (KeyCode::F11, ElementState::Pressed) => {
                                 if window.fullscreen().is_some() {
