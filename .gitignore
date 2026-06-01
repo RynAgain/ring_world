@@ -1,0 +1,15 @@
+# Rust / Cargo build artifacts
+/target/
+
+# Backtrace / debug symbols
+*.pdb
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Note: Cargo.lock IS committed for this binary crate so builds are reproducible.

@@ -1,0 +1,33 @@
+[package]
+name = "ring_world"
+version = "0.1.0"
+edition = "2021"
+description = "A voxel game set on a ring world (like a Halo/Niven Ring) with a sun in the center"
+
+[dependencies]
+wgpu = "0.20"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1.14", features = ["derive"] }
+cgmath = "0.18"
+noise = "0.9"
+env_logger = "0.11"
+log = "0.4"
+rand = "0.8"
+rayon = "1.10"
+image = "0.25"
+
+# Default game binary.
+[[bin]]
+name = "ring_world"
+path = "src/main.rs"
+
+# Headless demo: renders every block type from all 6 sides to PNG files.
+# Run with: cargo run --bin block_gallery
+[[bin]]
+name = "block_gallery"
+path = "src/bin/block_gallery.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
