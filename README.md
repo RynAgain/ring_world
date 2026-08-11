@@ -53,6 +53,8 @@ src/
 
 ## Controls
 
+Full, up-to-date reference: [CONTROLS.md](CONTROLS.md)
+
 | Key | Action |
 |-----|--------|
 | W/S | Move forward/backward (along ring) |
