@@ -57,6 +57,28 @@ terrain / spawning inside blocks" cluster:
   curved-vs-collision-grid agreement, reflection pinning, mesh-level CCW-outward
   winding at ring indices all around the ring, greedy cap enforcement.
 
+
+### Shadow Squares — Day/Night Cycle (2026-08-11)
+
+Niven-canon day/night: the sun never moves (eternal noon); night is cast by a
+chain of dark shadow squares orbiting between the sun and the ring.
+
+- **`shadow_squares.rs`**: 6 panels orbiting at 0.4R, umbral night fraction
+  0.35, full day+night cycle 600s (`DAY_CYCLE_SECS`), penumbra softness 0.03
+  rad (~20-block terminator band). `daylight_at(theta)` is the CPU mirror of
+  the shader formula (tests + F3 overlay).
+- **Per-fragment eclipse lighting** (shader.wgsl, `SunUniform.eclipse`):
+  occlusion = wrapped angular distance from the fragment's theta to the
+  nearest square center. Diffuse/specular fully eclipsed; ambient floors at
+  18% (the lit arch overhead keeps night moody, not void); fog sun-glow dims.
+  The terminator visibly sweeps the landscape, and the FAR side of the arch
+  stays lit during local night (it is shadowed at a different time).
+- **Visible panels**: dark silhouettes drawn with the distant-ring pipeline
+  (depth-write off) after the arch, before terrain.
+- **F8** cycles the time scale 1x / 20x / 120x to watch the eclipse sweep.
+- 6 unit tests (umbra/noon values, monotonic terminator, night fraction,
+  phase wrap, buffer consistency).
+
 ## 📦 Release Milestones
 
 ### v0.1 — Foundation (Complete)

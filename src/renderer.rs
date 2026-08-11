@@ -15,6 +15,7 @@ use crate::hud::{Hud, HudRenderData};
 use crate::player::{Player, PlacementPreview};
 use crate::lighting::LightingEngine;
 use crate::ring_world::{ChunkCoord, RingPosition, RingWorldConfig, curved_local_to_world};
+use crate::shadow_squares::ShadowSquares;
 use crate::sun::{Sun, SunUniform};
 use crate::terrain::TerrainGenerator;
 use crate::texture::TextureAtlas;
@@ -176,6 +177,19 @@ pub struct State {
     // Distant ring visualization
     distant_ring: DistantRing,
     distant_ring_transform_bind_group: wgpu::BindGroup,
+
+    // Shadow squares (day/night): orbital state + GPU buffers for the visible
+    // dark panels. Drawn with the distant-ring pipeline (depth write off,
+    // no culling) as sky objects; the LIGHTING side of the eclipse rides in
+    // SunUniform.eclipse and is applied per fragment in shader.wgsl.
+    shadow_squares: ShadowSquares,
+    shadow_vertex_buffer: wgpu::Buffer,
+    shadow_index_buffer: wgpu::Buffer,
+    shadow_num_indices: u32,
+
+    /// Time-scale multiplier for the day/night cycle (F8 cycles 1x/20x/120x,
+    /// for watching the eclipse sweep without waiting 10 minutes).
+    pub time_scale: f64,
 
     // HUD
     hud: Hud,
@@ -725,6 +739,24 @@ impl State {
                 label: Some("distant_ring_transform_bind_group"),
             });
 
+        // Shadow squares: initial geometry + buffers. The vertex buffer is
+        // rewritten every frame as the squares orbit; the index buffer is
+        // static (panel count never changes).
+        let shadow_squares = ShadowSquares::new(&ring_config);
+        let shadow_verts = shadow_squares.build_vertices();
+        let shadow_idx = shadow_squares.build_indices();
+        let shadow_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Shadow Squares Vertex Buffer"),
+            contents: bytemuck::cast_slice(&shadow_verts),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let shadow_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Shadow Squares Index Buffer"),
+            contents: bytemuck::cast_slice(&shadow_idx),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let shadow_num_indices = shadow_idx.len() as u32;
+
         // HUD
         let hud = Hud::new(&device, surface_format, size.width, size.height);
 
@@ -754,6 +786,11 @@ impl State {
             chunk_meshes: HashMap::new(),
             transform_bind_group_layout,
             distant_ring,
+            shadow_squares,
+            shadow_vertex_buffer,
+            shadow_index_buffer,
+            shadow_num_indices,
+            time_scale: 1.0,
             distant_ring_transform_bind_group,
             hud,
             player,
@@ -811,6 +848,16 @@ impl State {
     /// Toggle greedy meshing on/off (F7 A/B test) and force ALL loaded chunks to
     /// re-mesh so the change takes effect immediately. With greedy OFF, the
     /// mesher emits every visible block face as its own 1x1 quad (no merging).
+    /// F8: cycle the day/night time scale (1x -> 20x -> 120x -> 1x) so the
+    /// eclipse sweep can be watched without waiting out the real cycle.
+    pub fn cycle_time_scale(&mut self) {
+        self.time_scale = match self.time_scale as u32 {
+            1 => 20.0,
+            20 => 120.0,
+            _ => 1.0,
+        };
+    }
+
     pub fn toggle_greedy_mesh(&mut self) {
         self.enable_greedy_mesh = !self.enable_greedy_mesh;
         for (_, chunk) in self.chunk_manager.chunks.iter_mut() {
@@ -864,6 +911,15 @@ impl State {
     }
 
     pub fn update(&mut self, dt: std::time::Duration) {
+        // Advance the shadow-square orbit (day/night cycle) and refresh the
+        // panels' world-space vertices for the new phase.
+        self.shadow_squares.update(dt.as_secs_f64() * self.time_scale);
+        self.queue.write_buffer(
+            &self.shadow_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&self.shadow_squares.build_vertices()),
+        );
+
         // Ensure the chunks around the player are loaded and generated BEFORE
         // running physics, so the player never falls through ungenerated terrain
         // on the first frames after spawn. Once the spawn area is ready, snap the
@@ -1576,6 +1632,11 @@ impl State {
         lines.push(format!("FrustumCull: {} (F4)", on_off(self.enable_frustum_cull)));
         lines.push(format!("OcclusionCull: {} (F5)", on_off(self.enable_occlusion_cull)));
         lines.push(format!("RenderDebug: {} (F6)", on_off(self.debug_render)));
+        lines.push(format!(
+            "Daylight: {:.2} TimeScale: {}x (F8)",
+            self.shadow_squares.daylight_at(self.player.ring_position.theta),
+            self.time_scale as u32
+        ));
         lines.push(format!("GreedyMesh: {}", on_off(self.enable_greedy_mesh)));
 
         // Entities.
@@ -1616,6 +1677,7 @@ impl State {
         {
             let mut sun_uniform = SunUniform::from_sun(&self.sun);
             sun_uniform.set_debug_mode(self.debug_render);
+            sun_uniform.set_eclipse(self.shadow_squares.eclipse_uniform());
             self.queue
                 .write_buffer(&self.sun_buffer, 0, bytemuck::cast_slice(&[sun_uniform]));
         }
@@ -1725,6 +1787,14 @@ impl State {
             render_pass.set_vertex_buffer(0, self.distant_ring.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.distant_ring.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.distant_ring.num_indices, 0, 0..1);
+
+            // Shadow squares: drawn after the distant ring (they orbit NEARER
+            // than the far arch, so they must paint over it) but before the
+            // terrain (depth write off, so real chunks always cover them).
+            // Same pipeline/bind groups as the ring backdrop.
+            render_pass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.shadow_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..self.shadow_num_indices, 0, 0..1);
 
             // Now select the chunk pipeline. In F6 render-diagnostic mode use the
             // no-cull pipeline so EVERY face is drawn regardless of winding

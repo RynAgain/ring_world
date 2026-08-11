@@ -53,6 +53,12 @@ pub struct SunUniform {
     pub color: [f32; 4],
     /// Ambient light (xyz) + debug_mode flag (w): 0 = normal, 1 = render-debug.
     pub ambient: [f32; 4],
+    /// Shadow-square eclipse parameters (Niven Ringworld day/night):
+    /// x = square count (0 disables the eclipse entirely),
+    /// y = orbital phase (radians, angle of square 0's center),
+    /// z = angular half-width of each square (radians),
+    /// w = penumbra softness (radians). Consumed per fragment in shader.wgsl.
+    pub eclipse: [f32; 4],
 }
 
 impl SunUniform {
@@ -61,6 +67,7 @@ impl SunUniform {
             position: [0.0, 0.0, 0.0, 1.0],
             color: [1.0, 0.95, 0.8, 1.5],
             ambient: [0.3, 0.3, 0.3, 0.0],
+            eclipse: [0.0; 4],
         }
     }
 
@@ -69,7 +76,13 @@ impl SunUniform {
             position: [sun.position.x, sun.position.y, sun.position.z, 1.0],
             color: [sun.color[0], sun.color[1], sun.color[2], sun.intensity],
             ambient: [sun.ambient, sun.ambient, sun.ambient, 0.0],
+            eclipse: [0.0; 4],
         }
+    }
+
+    /// Set the shadow-square eclipse parameters (see field docs).
+    pub fn set_eclipse(&mut self, eclipse: [f32; 4]) {
+        self.eclipse = eclipse;
     }
 
     /// Set the render-debug flag (F6). When enabled the fragment shader outputs

@@ -8,7 +8,11 @@ struct CameraUniform {
 struct SunUniform {
     position: vec4<f32>,
     color: vec4<f32>,    // rgb = color, a = intensity
-    ambient: vec4<f32>,  // rgb = ambient color
+    ambient: vec4<f32>,  // rgb = ambient color, w = F6 debug flag
+    // Shadow-square eclipse (Niven Ringworld day/night):
+    // x = square count (0 disables), y = orbital phase (rad),
+    // z = square angular half-width (rad), w = penumbra softness (rad).
+    eclipse: vec4<f32>,
 };
 
 struct ChunkTransform {
@@ -188,21 +192,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // Shadow-square eclipse: the sun never moves (eternal noon); night falls
+    // when an orbiting shadow square passes between this FRAGMENT and the sun.
+    // A radial ray from the sun to a point at ring angle theta crosses the
+    // shadow-square orbit at the same angle, so occlusion is just the wrapped
+    // angular distance from the fragment's theta to the nearest square center.
+    // Computed per fragment so the terminator visibly sweeps the landscape and
+    // the far side of the arch overhead stays lit during local night.
+    // (Keep in sync with the CPU mirror ShadowSquares::daylight_at.)
+    var daylight = 1.0;
+    if (sun.eclipse.x > 0.5) {
+        let frag_theta = atan2(in.world_position.z, in.world_position.x);
+        let period = 6.28318530718 / sun.eclipse.x;
+        let rel = frag_theta - sun.eclipse.y;
+        let w = rel - period * floor(rel / period);
+        let d = min(w, period - w);
+        daylight = smoothstep(sun.eclipse.z, sun.eclipse.z + sun.eclipse.w, d);
+    }
+
     // Direction from fragment to sun (at center of ring)
     let to_sun = normalize(sun.position.xyz - in.world_position);
     
-    // Diffuse lighting
+    // Diffuse lighting (fully eclipsed by shadow squares)
     let diff = max(dot(normal, to_sun), 0.0);
-    let diffuse = sun.color.rgb * sun.color.a * diff;
+    let diffuse = sun.color.rgb * sun.color.a * diff * daylight;
     
-    // Ambient lighting (high on a ring world due to reflected light from opposite side)
-    let ambient = sun.ambient.rgb;
+    // Ambient lighting (high on a ring world due to reflected light from the
+    // opposite side). At night most of that reflected light is gone too, but
+    // the lit arch overhead keeps a floor of ~18% so night is moody, not void.
+    let ambient = sun.ambient.rgb * mix(0.18, 1.0, daylight);
     
     // Simple specular
     let view_dir = normalize(camera.view_position.xyz - in.world_position);
     let reflect_dir = reflect(-to_sun, normal);
     let spec = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0);
-    let specular = sun.color.rgb * spec * 0.2;
+    let specular = sun.color.rgb * spec * 0.2 * daylight;
     
     // Combine directional lighting with base color
     let directional_lighting = ambient + diffuse + specular;
@@ -225,7 +249,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Fog color: dark space with subtle warm glow toward sun direction
     let view_to_frag = normalize(in.world_position - camera.view_position.xyz);
     let sun_alignment = max(dot(view_to_frag, normalize(sun.position.xyz - camera.view_position.xyz)), 0.0);
-    let sun_glow = pow(sun_alignment, 8.0) * 0.3;
+    let sun_glow = pow(sun_alignment, 8.0) * 0.3 * daylight;
     let fog_color = vec3<f32>(0.01 + sun_glow * 0.2, 0.01 + sun_glow * 0.15, 0.03 + sun_glow * 0.05);
     
     let fogged = mix(final_color, fog_color, fog_factor);

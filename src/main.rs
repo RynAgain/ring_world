@@ -9,6 +9,7 @@ mod camera;
 mod terrain;
 mod structures;
 mod sun;
+mod shadow_squares;
 mod input;
 mod player;
 mod distant_ring;
@@ -152,6 +153,10 @@ fn main() {
                             // test for "is the greedy merge dropping faces?".
                             (KeyCode::F7, ElementState::Pressed) => {
                                 state.toggle_greedy_mesh();
+                            }
+                            // Cycle day/night time scale (F8): 1x/20x/120x
+                            (KeyCode::F8, ElementState::Pressed) => {
+                                state.cycle_time_scale();
                             }
                             // Toggle borderless fullscreen (F11)
                             (KeyCode::F11, ElementState::Pressed) => {
