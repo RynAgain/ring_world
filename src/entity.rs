@@ -58,6 +58,12 @@ pub struct Entity {
     pub is_grounded: bool,
     pub alive: bool,
     pub vertical_velocity: f64,
+    /// Yaw the mob is facing, in the ring-surface plane: 0 = +tangent
+    /// (increasing theta), pi/2 = +axial (increasing y). Set from movement.
+    pub facing: f64,
+    /// Walk-cycle phase in radians, advanced by distance walked; drives the
+    /// limb swing in build_entity_mesh.
+    pub walk_phase: f64,
 }
 
 impl Entity {
@@ -83,6 +89,8 @@ impl Entity {
             is_grounded: false,
             alive: true,
             vertical_velocity: 0.0,
+            facing: 0.0,
+            walk_phase: 0.0,
         }
     }
 
@@ -541,6 +549,31 @@ fn update_hostile_ai(
     }
 }
 
+/// Speed of the hop a mob uses to climb a 1-block step
+/// (apex = v^2 / (2 g) = 6.8^2 / 40 = ~1.16 blocks).
+const STEP_JUMP_SPEED: f64 = 6.8;
+/// Walk-cycle phase advance per block walked (one stride = ~0.9 blocks).
+const WALK_PHASE_PER_BLOCK: f64 = 7.0;
+
+/// Whether the mob's body fits standing at (theta, y) with its CENTER at
+/// `height`: samples near the feet and near the head, so collision happens at
+/// leg level (mobs stop clipping into 1-block rises) while still refusing to
+/// walk under overhangs they don't fit beneath.
+fn can_stand_at(
+    entity: &Entity,
+    theta: f64,
+    y: f64,
+    height: f64,
+    config: &RingWorldConfig,
+    chunk_manager: &ChunkManager,
+) -> bool {
+    let feet = height - entity.mob_height() * 0.5;
+    let low = RingPosition::new(theta, y, feet + 0.1);
+    let high = RingPosition::new(theta, y, feet + entity.mob_height() - 0.1);
+    !is_position_solid_entity(&low, config, chunk_manager)
+        && !is_position_solid_entity(&high, config, chunk_manager)
+}
+
 fn apply_movement(
     entity: &mut Entity,
     dt: f32,
@@ -564,25 +597,37 @@ fn apply_movement(
         let dist = (d_theta * d_theta + d_y * d_y).sqrt();
 
         if dist > 0.1 {
+            // Face the walk direction (yaw 0 = +tangent, pi/2 = +axial).
+            entity.facing = d_y.atan2(d_theta);
+
             let move_speed = entity.speed * dt_f64;
             let move_frac = (move_speed / dist).min(1.0);
 
             let new_theta = entity.position.theta + (d_theta / config.radius) * move_frac;
             let new_y = entity.position.y + d_y * move_frac;
+            let h = entity.position.height;
 
-            let check_pos = RingPosition::new(new_theta, new_y, entity.position.height);
-            if !is_position_solid_entity(&check_pos, config, chunk_manager) {
+            if can_stand_at(entity, new_theta, new_y, h, config, chunk_manager) {
                 entity.position.theta = new_theta;
                 entity.position.y = new_y;
+                entity.walk_phase += move_frac * dist * WALK_PHASE_PER_BLOCK;
+            } else if entity.is_grounded
+                && can_stand_at(entity, new_theta, new_y, h + 1.0, config, chunk_manager)
+            {
+                // A 1-block step ahead: hop it with a real jump impulse. The
+                // old code moved at constant height, clipped its feet into the
+                // step, and let the ground snap teleport the mob up a block,
+                // which read as constant twitchy "jumping" on any slope.
+                entity.vertical_velocity = STEP_JUMP_SPEED;
+                entity.is_grounded = false;
             } else {
-                let check_theta = RingPosition::new(new_theta, entity.position.y, entity.position.height);
-                if !is_position_solid_entity(&check_theta, config, chunk_manager) {
+                // Blocked straight ahead: try sliding along one axis.
+                if can_stand_at(entity, new_theta, entity.position.y, h, config, chunk_manager) {
                     entity.position.theta = new_theta;
-                } else {
-                    let check_y = RingPosition::new(entity.position.theta, new_y, entity.position.height);
-                    if !is_position_solid_entity(&check_y, config, chunk_manager) {
-                        entity.position.y = new_y;
-                    }
+                    entity.walk_phase += move_frac * d_theta.abs() * WALK_PHASE_PER_BLOCK;
+                } else if can_stand_at(entity, entity.position.theta, new_y, h, config, chunk_manager) {
+                    entity.position.y = new_y;
+                    entity.walk_phase += move_frac * d_y.abs() * WALK_PHASE_PER_BLOCK;
                 }
             }
         }
@@ -590,7 +635,6 @@ fn apply_movement(
 
     entity.position.normalize_theta();
 }
-
 fn apply_gravity(
     entity: &mut Entity,
     dt: f32,
@@ -633,12 +677,91 @@ fn apply_gravity(
     }
 }
 
-/// Build a renderable world-space mesh for every living entity: one shaded
-/// box per mob, sized by mob_width/mob_height, tinted by render_color, and
-/// oriented in the ring's local frame at the entity's theta (true tangent /
-/// radial-up / axial). Vertices are in WORLD space: draw with the identity
-/// transform bind group. The boxes go through the normal chunk shader, so
-/// they receive sun diffuse, the shadow-square eclipse, and fog for free.
+/// One box of a composite mob model. Offsets and half-extents are in blocks
+/// in the mob's local frame (forward, side, up), measured from the ground
+/// point under the mob's center (the "feet origin").
+struct MobPart {
+    offset: [f64; 3],
+    half: [f64; 3],
+    color_mul: [f32; 3],
+    /// Fore/aft sway amplitude sign for the walk animation; diagonal legs
+    /// (and humanoid arms vs legs) carry opposite signs so they swing in
+    /// opposition. 0.0 = rigid part.
+    swing: f64,
+}
+
+fn part(offset: [f64; 3], half: [f64; 3], color_mul: [f32; 3], swing: f64) -> MobPart {
+    MobPart { offset, half, color_mul, swing }
+}
+
+/// Composite box model per mob type (Minecraft-style: body + head + limbs).
+fn mob_parts(mob: MobType) -> Vec<MobPart> {
+    let leg = [0.55, 0.55, 0.55];
+    let head = [0.85, 0.85, 0.85];
+    let body = [1.0, 1.0, 1.0];
+    match mob {
+        MobType::Sheep => vec![
+            part([0.0, 0.0, 0.80], [0.45, 0.32, 0.30], body, 0.0),
+            part([0.50, 0.0, 1.05], [0.16, 0.14, 0.16], [0.75, 0.70, 0.70], 0.0),
+            part([0.28, 0.22, 0.25], [0.09, 0.09, 0.25], leg, 1.0),
+            part([0.28, -0.22, 0.25], [0.09, 0.09, 0.25], leg, -1.0),
+            part([-0.28, 0.22, 0.25], [0.09, 0.09, 0.25], leg, -1.0),
+            part([-0.28, -0.22, 0.25], [0.09, 0.09, 0.25], leg, 1.0),
+        ],
+        MobType::Cow => vec![
+            part([0.0, 0.0, 0.95], [0.50, 0.35, 0.33], body, 0.0),
+            part([0.58, 0.0, 1.28], [0.18, 0.16, 0.18], head, 0.0),
+            part([0.32, 0.24, 0.31], [0.10, 0.10, 0.31], leg, 1.0),
+            part([0.32, -0.24, 0.31], [0.10, 0.10, 0.31], leg, -1.0),
+            part([-0.32, 0.24, 0.31], [0.10, 0.10, 0.31], leg, -1.0),
+            part([-0.32, -0.24, 0.31], [0.10, 0.10, 0.31], leg, 1.0),
+        ],
+        MobType::Pig => vec![
+            part([0.0, 0.0, 0.63], [0.42, 0.30, 0.28], body, 0.0),
+            part([0.50, 0.0, 0.72], [0.15, 0.15, 0.15], head, 0.0),
+            part([0.67, 0.0, 0.68], [0.04, 0.08, 0.06], [0.95, 0.55, 0.55], 0.0),
+            part([0.26, 0.18, 0.17], [0.09, 0.09, 0.17], leg, 1.0),
+            part([0.26, -0.18, 0.17], [0.09, 0.09, 0.17], leg, -1.0),
+            part([-0.26, 0.18, 0.17], [0.09, 0.09, 0.17], leg, -1.0),
+            part([-0.26, -0.18, 0.17], [0.09, 0.09, 0.17], leg, 1.0),
+        ],
+        MobType::Chicken => vec![
+            part([0.0, 0.0, 0.41], [0.18, 0.14, 0.16], body, 0.0),
+            part([0.15, 0.0, 0.66], [0.09, 0.08, 0.11], body, 0.0),
+            part([0.28, 0.0, 0.64], [0.05, 0.03, 0.03], [1.0, 0.6, 0.2], 0.0),
+            part([0.02, 0.08, 0.12], [0.03, 0.03, 0.12], [0.9, 0.65, 0.3], 1.0),
+            part([0.02, -0.08, 0.12], [0.03, 0.03, 0.12], [0.9, 0.65, 0.3], -1.0),
+        ],
+        MobType::Zombie | MobType::Skeleton => vec![
+            part([0.0, 0.0, 1.20], [0.15, 0.25, 0.40], body, 0.0),
+            part([0.0, 0.0, 1.80], [0.16, 0.16, 0.20], head, 0.0),
+            part([0.0, 0.34, 1.28], [0.08, 0.08, 0.34], leg, -1.0),
+            part([0.0, -0.34, 1.28], [0.08, 0.08, 0.34], leg, 1.0),
+            part([0.0, 0.13, 0.40], [0.09, 0.09, 0.40], leg, 1.0),
+            part([0.0, -0.13, 0.40], [0.09, 0.09, 0.40], leg, -1.0),
+        ],
+        MobType::Spider => vec![
+            part([-0.10, 0.0, 0.42], [0.32, 0.28, 0.20], body, 0.0),
+            part([0.32, 0.0, 0.40], [0.16, 0.16, 0.14], [0.35, 0.15, 0.15], 0.0),
+            part([0.24, 0.40, 0.30], [0.05, 0.22, 0.04], leg, 1.0),
+            part([0.24, -0.40, 0.30], [0.05, 0.22, 0.04], leg, -1.0),
+            part([0.08, 0.42, 0.30], [0.05, 0.24, 0.04], leg, -1.0),
+            part([0.08, -0.42, 0.30], [0.05, 0.24, 0.04], leg, 1.0),
+            part([-0.08, 0.42, 0.30], [0.05, 0.24, 0.04], leg, 1.0),
+            part([-0.08, -0.42, 0.30], [0.05, 0.24, 0.04], leg, -1.0),
+            part([-0.24, 0.40, 0.30], [0.05, 0.22, 0.04], leg, -1.0),
+            part([-0.24, -0.40, 0.30], [0.05, 0.22, 0.04], leg, 1.0),
+        ],
+    }
+}
+
+/// Build a renderable world-space mesh for every living entity: a composite
+/// Minecraft-style box model (body, head, limbs) per mob, tinted by
+/// render_color, oriented in the ring's local frame at the entity's theta,
+/// rotated to its facing yaw, limbs swinging with walk_phase. Vertices are in
+/// WORLD space: draw with the identity transform bind group. The boxes go
+/// through the normal chunk shader, so they receive sun diffuse, the
+/// shadow-square eclipse, and fog for free.
 pub fn build_entity_mesh(
     entities: &[Entity],
     config: &RingWorldConfig,
@@ -648,8 +771,11 @@ pub fn build_entity_mesh(
     let mut vertices: Vec<crate::chunk::ChunkVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
+    let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
+    let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    let neg3 = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+
     for entity in entities.iter().filter(|e| e.alive) {
-        let center = entity.position.to_cartesian(config);
         let theta = entity.position.theta;
         let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
 
@@ -659,51 +785,80 @@ pub fn build_entity_mesh(
         let up = [-cos_t, 0.0, -sin_t]; // radial-in, toward the sun
         let axial = [0.0f32, 1.0, 0.0];
 
-        let hw = (entity.mob_width() * 0.5) as f32;
-        let hh = (entity.mob_height() * 0.5) as f32;
-        let c = [center.x as f32, center.y as f32, center.z as f32];
-        let color = entity.render_color();
+        // Rotate (tangent, axial) about `up` by the facing yaw. Rotation
+        // preserves handedness, so the face table below keeps the CCW-outward
+        // winding required by the back-face-culling opaque pipeline.
+        let (sin_f, cos_f) = (entity.facing.sin() as f32, entity.facing.cos() as f32);
+        let fwd = add3(scale3(tangent, cos_f), scale3(axial, sin_f));
+        let side = add3(scale3(tangent, -sin_f), scale3(axial, cos_f));
 
-        let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
-        let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-        let neg3 = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+        // World-space "feet origin": the ground point under the mob's center.
+        let feet_pos = crate::ring_world::RingPosition::new(
+            entity.position.theta,
+            entity.position.y,
+            entity.position.height - entity.mob_height() * 0.5,
+        );
+        let feet_cart = feet_pos.to_cartesian(config);
+        let feet = [feet_cart.x as f32, feet_cart.y as f32, feet_cart.z as f32];
 
-        // Each face: (outward normal, u basis, v basis, half-extents) chosen
-        // so u x v points along the normal (CCW-outward winding for the
-        // back-face-culling opaque pipeline).
-        let faces: [([f32; 3], [f32; 3], [f32; 3], f32, f32, f32); 6] = [
-            (tangent, axial, up, hw, hw, hh),           // +tangent: axial x up = tangent
-            (neg3(tangent), up, axial, hw, hh, hw),     // -tangent: up x axial = -tangent
-            (up, tangent, axial, hh, hw, hw),           // +up (head): tangent x axial = ... see test
-            (neg3(up), axial, tangent, hh, hw, hw),     // -up (feet)
-            (axial, up, tangent, hw, hh, hw),           // +axial
-            (neg3(axial), tangent, up, hw, hw, hh),     // -axial
-        ];
+        let base_color = entity.render_color();
+        let swing_off = entity.walk_phase.sin() * 0.12;
 
-        for (normal, u, v, n_half, u_half, v_half) in faces.iter() {
-            let fc = add3(c, scale3(*normal, *n_half));
-            let uu = scale3(*u, *u_half);
-            let vv = scale3(*v, *v_half);
-            let corners = [
-                add3(add3(fc, neg3(uu)), neg3(vv)),
-                add3(add3(fc, uu), neg3(vv)),
-                add3(add3(fc, uu), vv),
-                add3(add3(fc, neg3(uu)), vv),
+        for p in mob_parts(entity.mob_type) {
+            let off_f = (p.offset[0] + p.swing * swing_off) as f32;
+            let off_s = p.offset[1] as f32;
+            let off_u = p.offset[2] as f32;
+            let c = add3(
+                add3(feet, scale3(fwd, off_f)),
+                add3(scale3(side, off_s), scale3(up, off_u)),
+            );
+            let hf = p.half[0] as f32;
+            let hs = p.half[1] as f32;
+            let hu = p.half[2] as f32;
+            let color = [
+                base_color[0] * p.color_mul[0],
+                base_color[1] * p.color_mul[1],
+                base_color[2] * p.color_mul[2],
+                base_color[3],
             ];
-            let uvs = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-            let base = vertices.len() as u32;
-            for (i, corner) in corners.iter().enumerate() {
-                vertices.push(crate::chunk::ChunkVertex {
-                    position: *corner,
-                    normal: *normal,
-                    color,
-                    tex_coords: uvs[i],
-                    tex_index: TEX_SNOW,
-                    light_level: 1.0,
-                    alpha_tested: 0,
-                });
+
+            // Each face: (outward normal, u basis, v basis, half-extents)
+            // chosen so u x v points along the normal (CCW-outward winding
+            // for the back-face-culling opaque pipeline).
+            let faces: [([f32; 3], [f32; 3], [f32; 3], f32, f32, f32); 6] = [
+                (fwd, side, up, hf, hs, hu),
+                (neg3(fwd), up, side, hf, hu, hs),
+                (up, fwd, side, hu, hf, hs),
+                (neg3(up), side, fwd, hu, hs, hf),
+                (side, up, fwd, hs, hu, hf),
+                (neg3(side), fwd, up, hs, hf, hu),
+            ];
+
+            for (normal, u, v, n_half, u_half, v_half) in faces.iter() {
+                let fc = add3(c, scale3(*normal, *n_half));
+                let uu = scale3(*u, *u_half);
+                let vv = scale3(*v, *v_half);
+                let corners = [
+                    add3(add3(fc, neg3(uu)), neg3(vv)),
+                    add3(add3(fc, uu), neg3(vv)),
+                    add3(add3(fc, uu), vv),
+                    add3(add3(fc, neg3(uu)), vv),
+                ];
+                let uvs = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+                let base = vertices.len() as u32;
+                for (i, corner) in corners.iter().enumerate() {
+                    vertices.push(crate::chunk::ChunkVertex {
+                        position: *corner,
+                        normal: *normal,
+                        color,
+                        tex_coords: uvs[i],
+                        tex_index: TEX_SNOW,
+                        light_level: 1.0,
+                        alpha_tested: 0,
+                    });
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
     }
 
@@ -808,14 +963,17 @@ mod tests {
         // several ring angles.
         let config = crate::ring_world::RingWorldConfig::default();
         for theta in [0.0f64, 0.7, 1.6, 3.14, 4.5, 6.0] {
-            let e = super::Entity::new(
+            let mut e = super::Entity::new(
                 1,
                 super::MobType::Cow,
                 crate::ring_world::RingPosition::new(theta, 3.0, 10.0),
             );
+            e.facing = 0.9;
+            e.walk_phase = 2.3;
             let (verts, idx) = super::build_entity_mesh(&[e], &config);
-            assert_eq!(verts.len(), 24);
-            assert_eq!(idx.len(), 36);
+            // Cow model: 6 parts (body, head, 4 legs), 24 verts / 36 idx each.
+            assert_eq!(verts.len(), 24 * 6);
+            assert_eq!(idx.len(), 36 * 6);
             for tri in idx.chunks(3) {
                 let a = &verts[tri[0] as usize];
                 let b = &verts[tri[1] as usize];
@@ -839,6 +997,61 @@ mod tests {
                 assert!(dot > 0.0, "entity face winds against normal at theta {}", theta);
             }
         }
+    }
+
+    #[test]
+    fn mobs_hop_up_one_block_steps_instead_of_clipping() {
+        // A floor at height 10 with a 1-block step at height 11 halfway along
+        // the walk path. The mob must end standing ON the step top (feet ~12)
+        // having crossed it via the step-up jump, never clipping inside it.
+        use crate::chunk::{Chunk, ChunkManager};
+        use crate::voxel::{Voxel, VoxelType};
+
+        let config = crate::ring_world::RingWorldConfig::default();
+        let size = config.chunk_size;
+        let coord = crate::ring_world::ChunkCoord::new(0, 0, 0);
+        let mut chunk = Chunk::new(coord, size);
+        for lx in 0..size {
+            for lz in 0..size {
+                chunk.set_voxel(lx, 10, lz, Voxel::new(VoxelType::Stone));
+                if lx >= 8 {
+                    chunk.set_voxel(lx, 11, lz, Voxel::new(VoxelType::Stone));
+                }
+            }
+        }
+        let mut mgr = ChunkManager::new(config.clone(), 2);
+        mgr.chunks.insert(coord, chunk);
+
+        let block_theta = config.chunk_angular_size() / size as f64;
+        let y0 = -config.width / 2.0 + 8.5;
+        let mut e = super::Entity::new(
+            1,
+            super::MobType::Pig,
+            crate::ring_world::RingPosition::new(4.5 * block_theta, y0, 11.5),
+        );
+
+        for _ in 0..400 {
+            // Keep the walk target alive (wandering AI normally does this).
+            e.target_position = Some(crate::ring_world::RingPosition::new(
+                12.5 * block_theta,
+                y0,
+                e.position.height,
+            ));
+            super::apply_movement(&mut e, 0.05, &config, &mgr);
+            super::apply_gravity(&mut e, 0.05, &config, &mgr);
+        }
+
+        let feet = e.position.height - e.mob_height() * 0.5;
+        assert!(
+            feet > 11.9 && feet < 12.2,
+            "mob should stand on the step top, feet at {}",
+            feet
+        );
+        assert!(
+            e.position.theta > 9.0 * block_theta,
+            "mob should have crossed the step, theta {}",
+            e.position.theta
+        );
     }
 
     #[test]
