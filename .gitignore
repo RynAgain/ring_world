@@ -13,3 +13,4 @@ Thumbs.db
 .vscode/
 
 # Note: Cargo.lock IS committed for this binary crate so builds are reproducible.
+world.save
