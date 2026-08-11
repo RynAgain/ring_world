@@ -24,6 +24,39 @@ A round of bug fixes following v0.4 addressed rendering, spawning, and asset iss
 
 ---
 
+
+### Curved-Mesh Rendering Rewrite (2026-08-11)
+
+Root-cause fix for the long-standing "seams / missing faces / falling through
+terrain / spawning inside blocks" cluster:
+
+- **Diagnosis**: collision, raycast, spawn, and placement all live on the exact
+  ANGULAR voxel grid (theta uniform in angle), but chunks were RENDERED as flat
+  linear boxes via a single `chunk_transform` matrix. A linear matrix cannot
+  represent the polar mapping: rendered chunks were ~0.2 blocks too narrow at
+  the surface (gaps at every ring-chunk boundary), stacked chunks used different
+  tangent scales (misaligned columns), and the transform used a MIRRORED tangent
+  `(sin, 0, -cos)` to keep a positive determinant, drawing every chunk reversed
+  along the ring axis relative to the collision grid. Visuals and physics could
+  never agree.
+- **Fix**: `curved_local_to_world` / `curved_normal` (ring_world.rs) map every
+  mesh vertex through the exact ring equation; boundary vertices are computed
+  from global voxel indices so adjacent chunks produce bit-identical positions
+  (seams close exactly). `curve_mesh_data` (chunk.rs) bakes this into all three
+  mesh paths (greedy / non-greedy / LOD) and reverses triangle index order to
+  compensate for the ring frame's reflection. Chunks now draw with an identity
+  model matrix.
+- **Greedy merge cap**: merged quads along the ring (theta) axis are capped at
+  4 voxels (`RING_MERGE_CAP`) so flat chord quads never sag more than ~0.003
+  blocks below the curved surface.
+- **Back-face culling re-enabled** on the opaque pipeline (it had been disabled
+  as a workaround for the mirrored-tangent winding flips).
+- **Highlight/preview box** and frustum-culling chunk centers use the same
+  curved mapping.
+- Regression tests: boundary bit-exactness (ring wrap, height, width),
+  curved-vs-collision-grid agreement, reflection pinning, mesh-level CCW-outward
+  winding at ring indices all around the ring, greedy cap enforcement.
+
 ## 📦 Release Milestones
 
 ### v0.1 — Foundation (Complete)

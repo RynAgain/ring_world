@@ -282,8 +282,17 @@ impl Chunk {
                         let (vtype, tex_idx, light, color) = mask[idx].unwrap();
                         visited[idx] = true;
 
+                        // Cap merges along the RING (theta) axis: for Y/Z faces
+                        // the u-run maps to local x, and long chord quads sag
+                        // below the curved surface (see RING_MERGE_CAP). X faces
+                        // lie at constant theta (exactly planar when curved), so
+                        // their u-run (which maps to z) stays uncapped.
+                        let max_u_run = match face {
+                            Face::PosX | Face::NegX => size,
+                            _ => RING_MERGE_CAP.min(size),
+                        };
                         let mut width = 1u32;
-                        while u + width < size {
+                        while u + width < size && width < max_u_run {
                             let ni = ((u + width) + v * size) as usize;
                             if visited[ni] { break; }
                             match mask[ni] {
@@ -692,6 +701,56 @@ pub fn is_translucent(voxel_type: VoxelType) -> bool {
 /// "grass sides are transparent / show nothing" bug.
 pub fn is_alpha_tested(voxel_type: VoxelType) -> bool {
     is_cross_render(voxel_type) || matches!(voxel_type, VoxelType::Leaves)
+}
+
+/// Maximum greedy-merge run length along the RING (theta / local-x) axis.
+///
+/// Curved meshing (see `curve_mesh_data`) maps only quad CORNERS through the
+/// exact ring equation, so a merged quad is a flat chord across the curved
+/// surface. The chord-vs-arc deviation (sagitta) grows quadratically with the
+/// span: a 16-voxel run sags ~0.05 blocks (visible cracks / T-junction
+/// pinholes against differently-merged neighbors), while a 4-voxel run sags
+/// ~0.003 blocks (sub-pixel). Runs along height (radial) and width (axial)
+/// are exactly planar under the curved mapping and stay uncapped.
+pub const RING_MERGE_CAP: u32 = 4;
+
+/// Curve a chunk mesh in place: map every vertex of the opaque and water
+/// buffers through the exact ring equation (`curved_local_to_world`) and
+/// rotate its normal into the world frame at the vertex's own theta
+/// (`curved_normal`). After this, the mesh is in WORLD space and must be drawn
+/// with an IDENTITY model transform.
+///
+/// This replaces the flat per-chunk `chunk_transform` rendering path, which
+/// could not follow the ring's curvature and desynced the visuals from the
+/// angular collision grid (seams at chunk boundaries, falling through visible
+/// terrain, spawning "inside" blocks).
+pub fn curve_mesh_data(mesh: &mut ChunkMeshData, coord: &ChunkCoord, config: &RingWorldConfig) {
+    for v in mesh
+        .opaque_vertices
+        .iter_mut()
+        .chain(mesh.water_vertices.iter_mut())
+    {
+        // Normal first: it needs the ORIGINAL local x for its theta.
+        v.normal = crate::ring_world::curved_normal(coord, v.position[0], v.normal, config);
+        v.position = crate::ring_world::curved_local_to_world(coord, v.position, config);
+    }
+
+    // The exact ring frame (true tangent dP/dtheta = (-sin, 0, cos), radial-in,
+    // axial) is LEFT-handed relative to the chunk-local mesh frame: the old
+    // flat `chunk_transform` dodged this by using the MIRRORED tangent
+    // (sin, 0, -cos) to keep a positive determinant, which drew every chunk
+    // reversed along the ring axis relative to the collision grid (the root
+    // cause of the pervasive visual-vs-collision mismatch). The curved mapping
+    // is a reflection of local space, so it flips every triangle's screen
+    // winding; reverse the index order of each triangle to restore
+    // CCW-outward, which lets back-face culling work correctly again.
+    for tri in mesh
+        .opaque_indices
+        .chunks_mut(3)
+        .chain(mesh.water_indices.chunks_mut(3))
+    {
+        tri.swap(1, 2);
+    }
 }
 
 /// Face-culling occlusion rule (Issue 2).
@@ -1479,6 +1538,134 @@ mod tests {
         let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let len = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
         len > 1e-3 && dot > 0.0
+    }
+
+    /// After curve_mesh_data (positions curved + triangle indices reversed),
+    /// every triangle's geometric winding must agree with its outward vertex
+    /// normal (CCW front faces), at ring indices all around the ring. This is
+    /// the guard that lets the opaque pipeline keep back-face culling ON.
+    #[test]
+    fn curved_mesh_triangles_wind_ccw_outward() {
+        let config = RingWorldConfig::default();
+        for ring in [0u32, 43, 64, 128, 200, 255] {
+            for h in [0u32, 3] {
+                let coord = ChunkCoord::new(ring, 8, h);
+                let mut chunk = Chunk::new(coord, 16);
+                // Uneven terrain so all six face directions are emitted.
+                for z in 0..16u32 {
+                    for x in 0..16u32 {
+                        let top = 2 + ((x / 3 + z / 4) % 4);
+                        for y in 0..top {
+                            chunk.set_voxel(x, y, z, Voxel::new(VoxelType::Stone));
+                        }
+                    }
+                }
+                let neighbors: [Option<&Chunk>; 6] = [None; 6];
+                let mut mesh = chunk.generate_mesh_split(&neighbors);
+                curve_mesh_data(&mut mesh, &coord, &config);
+
+                for tri in mesh.opaque_indices.chunks(3) {
+                    let a = &mesh.opaque_vertices[tri[0] as usize];
+                    let b = &mesh.opaque_vertices[tri[1] as usize];
+                    let c = &mesh.opaque_vertices[tri[2] as usize];
+                    let e1 = [
+                        b.position[0] - a.position[0],
+                        b.position[1] - a.position[1],
+                        b.position[2] - a.position[2],
+                    ];
+                    let e2 = [
+                        c.position[0] - a.position[0],
+                        c.position[1] - a.position[1],
+                        c.position[2] - a.position[2],
+                    ];
+                    let geo = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    let dot = geo[0] * a.normal[0] + geo[1] * a.normal[1] + geo[2] * a.normal[2];
+                    assert!(
+                        dot > 0.0,
+                        "triangle at ring {} h {} winds against its normal {:?} (dot {})",
+                        ring, h, a.normal, dot
+                    );
+                }
+            }
+        }
+    }
+
+    /// Greedy quads on faces that span the ring (theta) axis must never merge
+    /// wider than RING_MERGE_CAP voxels along local x, or the flat chord quad
+    /// sags visibly below the curved surface (cracks / T-junction pinholes).
+    #[test]
+    fn greedy_merge_capped_along_ring_axis() {
+        let mut chunk = Chunk::new(test_coord(), 16);
+        // A flat 16x16 stone slab, one voxel thick: the top face is a single
+        // uncapped greedy region that would otherwise merge to 16x16.
+        for z in 0..16 {
+            for x in 0..16 {
+                chunk.set_voxel(x, 0, z, Voxel::new(VoxelType::Stone));
+            }
+        }
+        let neighbors: [Option<&Chunk>; 6] = [None; 6];
+        let mesh = chunk.generate_mesh_split(&neighbors);
+
+        // Every quad is 4 consecutive vertices. For quads facing +/-Y or +/-Z
+        // the x-extent must be <= RING_MERGE_CAP.
+        assert!(mesh.opaque_vertices.len() % 4 == 0);
+        for quad in mesh.opaque_vertices.chunks(4) {
+            let n = quad[0].normal;
+            let is_x_face = n[0].abs() > 0.5;
+            if is_x_face {
+                continue;
+            }
+            let xs: Vec<f32> = quad.iter().map(|v| v.position[0]).collect();
+            let extent = xs.iter().cloned().fold(f32::MIN, f32::max)
+                - xs.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(
+                extent <= RING_MERGE_CAP as f32 + 1e-6,
+                "quad with normal {:?} spans {} voxels along the ring axis",
+                n, extent
+            );
+        }
+    }
+
+    /// curve_mesh_data maps vertices through the exact ring equation: after
+    /// curving, every vertex must lie exactly at radius (R - height) from the
+    /// ring axis, and normals must stay unit-length.
+    #[test]
+    fn curve_mesh_data_puts_vertices_on_the_ring() {
+        let config = RingWorldConfig::default();
+        let coord = ChunkCoord::new(37, 5, 1);
+        let mut chunk = Chunk::new(coord, 16);
+        for z in 0..16 {
+            for x in 0..16 {
+                for y in 0..3 {
+                    chunk.set_voxel(x, y, z, Voxel::new(VoxelType::Stone));
+                }
+            }
+        }
+        let neighbors: [Option<&Chunk>; 6] = [None; 6];
+        let mut mesh = chunk.generate_mesh_split(&neighbors);
+
+        // Capture local heights before curving (position[1] is local height).
+        let local_heights: Vec<f32> = mesh.opaque_vertices.iter().map(|v| v.position[1]).collect();
+        curve_mesh_data(&mut mesh, &coord, &config);
+
+        let chunk_h0 = coord.height_index as f64 * config.chunk_height_size();
+        for (v, lh) in mesh.opaque_vertices.iter().zip(local_heights.iter()) {
+            let height = chunk_h0 + *lh as f64;
+            let expect_r = config.radius - height;
+            let r = ((v.position[0] as f64).powi(2) + (v.position[2] as f64).powi(2)).sqrt();
+            assert!(
+                (r - expect_r).abs() < 1e-3,
+                "vertex radius {} != expected {} (height {})",
+                r, expect_r, height
+            );
+            let n = v.normal;
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-4, "normal not unit: {:?}", n);
+        }
     }
 
     #[test]

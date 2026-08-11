@@ -14,7 +14,7 @@ use crate::entity::EntityManager;
 use crate::hud::{Hud, HudRenderData};
 use crate::player::{Player, PlacementPreview};
 use crate::lighting::LightingEngine;
-use crate::ring_world::{ChunkCoord, RingPosition, RingWorldConfig, chunk_transform};
+use crate::ring_world::{ChunkCoord, RingPosition, RingWorldConfig, curved_local_to_world};
 use crate::sun::{Sun, SunUniform};
 use crate::terrain::TerrainGenerator;
 use crate::texture::TextureAtlas;
@@ -426,20 +426,17 @@ impl State {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                // Back-face culling DISABLED. On the ring world the per-chunk
-                // model transform applies a non-uniform per-axis scale and a
-                // rotation that varies with the chunk's angle around the ring.
-                // Although the determinant is positive at theta=0, the combined
-                // transform + greedy winding was leaving roughly half of the
-                // horizontal voxel side faces wound clockwise in screen space at
-                // many ring positions, so `cull_mode: Back` silently dropped
-                // them ("top + 2 of 4 sides render, the other 2 are missing").
-                // Voxel terrain is already interior-face-culled by the mesher, so
-                // there is no meaningful overdraw cost to drawing both sides, and
-                // this guarantees every emitted face is visible regardless of how
-                // the ring transform orients it. (Water has its own no-cull
-                // pipeline already.)
-                cull_mode: None,
+                // Back-face culling ON. Chunk meshes are pre-curved into
+                // world space by `curve_mesh_data`, which also reverses each
+                // triangle's index order to compensate for the ring frame's
+                // reflection, so every front face is consistently CCW-outward
+                // (guarded by chunk::tests::curved_mesh_triangles_wind_ccw_outward).
+                // The historical "half the side faces missing at many ring
+                // positions" symptom came from the old flat chunk_transform's
+                // mirrored tangent, which is gone. Cross-render billboards emit
+                // both sides explicitly and survive culling. (Water keeps its
+                // own no-cull pipeline.)
+                cull_mode: Some(wgpu::Face::Back),
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -1041,7 +1038,7 @@ impl State {
                     // full-solid occlusion fix, is best reserved for far chunks.
                     let dist = chunk_manager.chunk_distance(&coord, &player_pos);
                     let is_lod = dist > 7;
-                    let mesh = if is_lod {
+                    let mut mesh = if is_lod {
                         chunk.generate_lod_mesh_split(&neighbors)
                     } else if greedy {
                         chunk.generate_mesh_split(&neighbors)
@@ -1050,6 +1047,11 @@ impl State {
                         // face as its own quad (no merging).
                         chunk.generate_mesh_split_no_greedy(&neighbors)
                     };
+                    // Bake the exact ring curvature into the vertices so the
+                    // rendered geometry matches the ANGULAR collision grid
+                    // exactly (no flat-chunk seams, no visual/collision skew).
+                    // The mesh is now world-space: drawn with identity model.
+                    crate::chunk::curve_mesh_data(&mut mesh, &coord, config);
                     (coord, mesh, is_lod)
                 })
                 .collect();
@@ -1065,12 +1067,10 @@ impl State {
                     chunk.mesh_version
                 };
 
-                // Compute chunk world-space center for frustum culling.
-                let transform_matrix = chunk_transform(&coord, &self.ring_config);
+                // Chunk world-space center for frustum culling, via the same
+                // curved mapping the vertices use.
                 let half = self.ring_config.chunk_size as f32 * 0.5;
-                let center_local = cgmath::Vector4::new(half, half, half, 1.0);
-                let center_world = transform_matrix * center_local;
-                let center = [center_world.x, center_world.y, center_world.z];
+                let center = curved_local_to_world(&coord, [half, half, half], &self.ring_config);
 
                 let has_opaque = !mesh.opaque_vertices.is_empty() && !mesh.opaque_indices.is_empty();
                 let has_water = !mesh.water_vertices.is_empty() && !mesh.water_indices.is_empty();
@@ -1131,8 +1131,10 @@ impl State {
                     (None, None, 0u32)
                 };
 
+                // Vertices are pre-curved into world space; the model
+                // transform is identity.
                 let transform_uniform = ChunkTransformUniform {
-                    model: transform_matrix.into(),
+                    model: cgmath::Matrix4::from_scale(1.0f32).into(),
                 };
 
                 let transform_buffer =
@@ -1409,8 +1411,6 @@ impl State {
     /// Generate a wireframe cube mesh at the given block position
     /// Returns vertices and indices for 12 edges rendered as thin quads
     fn generate_highlight_mesh(&self, preview: &PlacementPreview) -> (Vec<HighlightVertex>, Vec<u32>) {
-        // Get the chunk transform to position the block in world space
-        let transform_matrix = chunk_transform(&preview.chunk_coord, &self.ring_config);
 
         // Block local position within chunk (each block is 1 unit)
         let bx = preview.local_x as f32;
@@ -1440,11 +1440,11 @@ impl State {
             [bx - e,       by + 1.0 + e, bz + 1.0 + e], // 7: -++
         ];
 
-        // Transform corners to world space using the chunk transform
+        // Map corners to world space through the exact curved ring mapping,
+        // matching the curved chunk meshes (the old flat chunk_transform put
+        // the highlight box up to ~0.5 blocks away from the rendered block).
         let transformed: Vec<[f32; 3]> = corners.iter().map(|c| {
-            let v = cgmath::Vector4::new(c[0], c[1], c[2], 1.0);
-            let result = transform_matrix * v;
-            [result.x, result.y, result.z]
+            curved_local_to_world(&preview.chunk_coord, *c, &self.ring_config)
         }).collect();
 
         // 12 edges of a cube, each edge becomes a thin quad (2 triangles)

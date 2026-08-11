@@ -284,6 +284,71 @@ pub fn chunk_transform(coord: &ChunkCoord, config: &RingWorldConfig) -> Matrix4<
     transform
 }
 
+/// Exact curved mapping from a chunk-local mesh position to world space.
+///
+/// This is the geometry-side counterpart of the ANGULAR voxel grid that
+/// collision / raycast / spawn already use (`is_position_solid` maps theta
+/// uniformly in ANGLE). The old rendering path approximated each chunk as a
+/// FLAT box via a single linear `chunk_transform`, whose tangent scale was
+/// picked at the chunk's center height. A linear matrix cannot represent the
+/// polar mapping, so the flat box diverged from the collision grid by up to
+/// ~0.2 blocks at ring-chunk boundaries at the surface (visible GAPS/seams)
+/// and ~0.4+ blocks across height-chunk boundaries: the player fell through
+/// blocks they could see, stood on invisible ground, and appeared to spawn
+/// inside terrain even though the collision-side spawn logic was correct.
+///
+/// This function instead maps EVERY mesh vertex through the exact ring
+/// equation. The global voxel angle is computed from
+/// `ring_index * chunk_size + local_x` so a boundary vertex shared by two
+/// adjacent chunks evaluates to a bit-identical f64 angle in both -> the ring
+/// closes seamlessly with no cracks.
+///
+/// Local axes (same convention as `chunk_transform`):
+/// - local x: along ring circumference (theta)
+/// - local y: height above surface (radial, toward sun)
+/// - local z: along ring width (axial)
+pub fn curved_local_to_world(coord: &ChunkCoord, local: [f32; 3], config: &RingWorldConfig) -> [f32; 3] {
+    let cs = config.chunk_size as f64;
+    let voxel_dtheta = config.chunk_angular_size() / cs;
+    let h_per_voxel = config.chunk_height_size() / cs;
+    let w_per_voxel = config.chunk_width_size() / cs;
+
+    // Global voxel-grid coordinates (f64, integer-exact at voxel corners).
+    let gx = coord.ring_index as f64 * cs + local[0] as f64;
+    let gh = coord.height_index as f64 * cs + local[1] as f64;
+    let gw = coord.width_index as f64 * cs + local[2] as f64;
+
+    let theta = gx * voxel_dtheta;
+    let height = gh * h_per_voxel;
+    let y = -config.width / 2.0 + gw * w_per_voxel;
+
+    let r = config.radius - height;
+    [(r * theta.cos()) as f32, y as f32, (r * theta.sin()) as f32]
+}
+
+/// World-space direction of a chunk-local normal at the given local-x (theta)
+/// position, for curved meshes produced with [`curved_local_to_world`].
+///
+/// The local frame at angle theta is the orthonormal right-handed basis
+/// (tangent, radial_in, axial), a pure rotation, so normals stay unit-length
+/// and no inverse-transpose is needed.
+pub fn curved_normal(coord: &ChunkCoord, local_x: f32, normal: [f32; 3], config: &RingWorldConfig) -> [f32; 3] {
+    let cs = config.chunk_size as f64;
+    let voxel_dtheta = config.chunk_angular_size() / cs;
+    let theta = (coord.ring_index as f64 * cs + local_x as f64) * voxel_dtheta;
+    let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
+
+    // local x -> TRUE tangent dP/dtheta = (-sin, 0, cos) (NOT chunk_transform's
+    // mirrored (sin, 0, -cos), which pointed ring-direction normals backwards),
+    // local y -> radial_in (toward sun), local z -> axial.
+    let (nx, ny, nz) = (normal[0], normal[1], normal[2]);
+    [
+        nx * (-sin_t) + ny * (-cos_t),
+        nz,
+        nx * cos_t + ny * (-sin_t),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +613,147 @@ mod tests {
                      (geo·outward = {}); GPU would back-face-cull it",
                     idx, coord, dot
                 );
+            }
+        }
+    }
+
+    /// Curved-mesh seam guard: a boundary vertex shared by two adjacent chunks
+    /// must map to a BIT-IDENTICAL world position from both sides, on all
+    /// three axes (ring — including the 255->0 wrap — height, and width).
+    /// This is the regression test for the visible gaps/seams produced by the
+    /// old flat per-chunk transform.
+    #[test]
+    fn curved_boundary_vertices_bit_identical_across_chunks() {
+        let config = RingWorldConfig::default();
+        let cs = config.chunk_size as f32;
+
+        // Ring axis, including the wrap seam.
+        for ring in [0u32, 7, 100, config.chunks_circumference - 1] {
+            let a = ChunkCoord::new(ring, 3, 1);
+            let b = ChunkCoord::new((ring + 1) % config.chunks_circumference, 3, 1);
+            for &(ly, lz) in &[(0.0f32, 0.0f32), (5.0, 9.0), (16.0, 16.0)] {
+                let pa = curved_local_to_world(&a, [cs, ly, lz], &config);
+                let pb = curved_local_to_world(&b, [0.0, ly, lz], &config);
+                let wrap = ring == config.chunks_circumference - 1;
+                for i in 0..3 {
+                    let d = (pa[i] - pb[i]).abs();
+                    // Non-wrap boundaries must be bit-exact; the wrap seam
+                    // (theta 2*PI vs 0) is allowed f64 rounding noise.
+                    let tol = if wrap { 1e-3 } else { 0.0 };
+                    assert!(d <= tol, "ring seam at {} axis {}: {} vs {}", ring, i, pa[i], pb[i]);
+                }
+            }
+        }
+
+        // Height axis (stacked chunks) — where the old code diverged worst.
+        let a = ChunkCoord::new(42, 3, 0);
+        let b = ChunkCoord::new(42, 3, 1);
+        for &(lx, lz) in &[(0.0f32, 0.0f32), (16.0, 4.0), (11.0, 16.0)] {
+            let pa = curved_local_to_world(&a, [lx, cs, lz], &config);
+            let pb = curved_local_to_world(&b, [lx, 0.0, lz], &config);
+            assert_eq!(pa, pb, "height seam at ({}, {})", lx, lz);
+        }
+
+        // Width axis.
+        let a = ChunkCoord::new(42, 3, 1);
+        let b = ChunkCoord::new(42, 4, 1);
+        for &(lx, ly) in &[(0.0f32, 0.0f32), (16.0, 16.0), (8.0, 2.0)] {
+            let pa = curved_local_to_world(&a, [lx, ly, cs], &config);
+            let pb = curved_local_to_world(&b, [lx, ly, 0.0], &config);
+            assert_eq!(pa, pb, "width seam at ({}, {})", lx, ly);
+        }
+    }
+
+    /// The curved mesh mapping must agree with the ANGULAR voxel grid that
+    /// collision / raycast / spawn use (RingPosition::to_cartesian), so what
+    /// you see is exactly what you collide with.
+    #[test]
+    fn curved_mapping_matches_collision_grid() {
+        let config = RingWorldConfig::default();
+        let cs = config.chunk_size as f64;
+        for &(ring, w, h) in &[(0u32, 0u32, 0u32), (5, 3, 1), (200, 15, 3)] {
+            let coord = ChunkCoord::new(ring, w, h);
+            for &(lx, ly, lz) in &[(0.0f64, 0.0, 0.0), (7.0, 3.0, 12.0), (16.0, 16.0, 16.0)] {
+                let ring_pos = RingPosition::new(
+                    (ring as f64 * cs + lx) * (config.chunk_angular_size() / cs),
+                    -config.width / 2.0 + (w as f64 * cs + lz) * (config.chunk_width_size() / cs),
+                    (h as f64 * cs + ly) * (config.chunk_height_size() / cs),
+                );
+                let expect = ring_pos.to_cartesian(&config);
+                let got = curved_local_to_world(&coord, [lx as f32, ly as f32, lz as f32], &config);
+                assert!((got[0] as f64 - expect.x).abs() < 1e-3, "x {} vs {}", got[0], expect.x);
+                assert!((got[1] as f64 - expect.y).abs() < 1e-3, "y {} vs {}", got[1], expect.y);
+                assert!((got[2] as f64 - expect.z).abs() < 1e-3, "z {} vs {}", got[2], expect.z);
+            }
+        }
+    }
+
+    /// The exact curved mapping is a REFLECTION of chunk-local space (the true
+    /// ring tangent frame is left-handed), so raw CCW mesh winding flips for
+    /// EVERY face at EVERY ring index: the geometric normal from the raw corner
+    /// order must point OPPOSITE the outward `curved_normal`. `curve_mesh_data`
+    /// compensates by reversing each triangle's index order (verified at the
+    /// mesh level in chunk::tests::curved_mesh_triangles_wind_ccw_outward).
+    /// This test pins the reflection property itself, so an accidental
+    /// double-flip (or a future "fix" that removes the reversal) fails loudly.
+    #[test]
+    fn curved_mapping_reflects_raw_winding_all_directions() {
+        let config = RingWorldConfig::default();
+        let unit = 1.0f32;
+        let faces: [([[f32; 3]; 4], [f32; 3]); 6] = [
+            ([[unit, 0.0, 0.0], [unit, unit, 0.0], [unit, unit, unit], [unit, 0.0, unit]], [1.0, 0.0, 0.0]),
+            ([[0.0, 0.0, unit], [0.0, unit, unit], [0.0, unit, 0.0], [0.0, 0.0, 0.0]], [-1.0, 0.0, 0.0]),
+            ([[0.0, unit, 0.0], [0.0, unit, unit], [unit, unit, unit], [unit, unit, 0.0]], [0.0, 1.0, 0.0]),
+            ([[unit, 0.0, 0.0], [unit, 0.0, unit], [0.0, 0.0, unit], [0.0, 0.0, 0.0]], [0.0, -1.0, 0.0]),
+            ([[unit, 0.0, unit], [unit, unit, unit], [0.0, unit, unit], [0.0, 0.0, unit]], [0.0, 0.0, 1.0]),
+            ([[0.0, 0.0, 0.0], [0.0, unit, 0.0], [unit, unit, 0.0], [unit, 0.0, 0.0]], [0.0, 0.0, -1.0]),
+        ];
+
+        for ring in 0..config.chunks_circumference {
+            for h in 0..config.chunks_height {
+                let coord = ChunkCoord::new(ring, 8, h);
+                for (idx, (local_pos, local_normal)) in faces.iter().enumerate() {
+                    let wp: Vec<[f32; 3]> = local_pos
+                        .iter()
+                        .map(|p| curved_local_to_world(&coord, *p, &config))
+                        .collect();
+                    let e1 = [wp[1][0] - wp[0][0], wp[1][1] - wp[0][1], wp[1][2] - wp[0][2]];
+                    let e2 = [wp[2][0] - wp[0][0], wp[2][1] - wp[0][1], wp[2][2] - wp[0][2]];
+                    let geo = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    let wn = curved_normal(&coord, local_pos[0][0], *local_normal, &config);
+                    let dot = geo[0] * wn[0] + geo[1] * wn[1] + geo[2] * wn[2];
+                    assert!(
+                        dot < 0.0,
+                        "face {} at chunk {:?}: raw winding unexpectedly matches the outward \
+                         normal (dot = {}); the curved frame reflection changed - revisit \
+                         curve_mesh_data's triangle index reversal",
+                        idx, coord, dot
+                    );
+                }
+            }
+        }
+    }
+
+    /// Curved normals must stay unit-length and match the local frame at the
+    /// vertex's own theta.
+    #[test]
+    fn curved_normal_is_unit_and_radial_up_points_inward() {
+        let config = RingWorldConfig::default();
+        for ring in [0u32, 31, 64, 128, 200, 255] {
+            let coord = ChunkCoord::new(ring, 8, 0);
+            for lx in [0.0f32, 8.0, 16.0] {
+                let up = curved_normal(&coord, lx, [0.0, 1.0, 0.0], &config);
+                let len = (up[0] * up[0] + up[1] * up[1] + up[2] * up[2]).sqrt();
+                assert!((len - 1.0).abs() < 1e-5);
+                // "Up" (radial-in) must point from the vertex toward the ring
+                // axis: dot(up, -position_xz) > 0.
+                let p = curved_local_to_world(&coord, [lx, 0.0, 8.0], &config);
+                let dot = up[0] * (-p[0]) + up[2] * (-p[2]);
+                assert!(dot > 0.0, "up at ring {} lx {} points outward", ring, lx);
             }
         }
     }
