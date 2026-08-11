@@ -515,3 +515,33 @@ src/
 
 Tests: 216 total (185 ring_world + 31 block_gallery), all passing.
 Note: terrain shapes changed vs earlier builds (2D noise became periodic 3D/4D), so saves from before e511c97 will place their edits on different terrain.
+
+## 2026-08-11 Batch 2: Mob Polish, Movement Fix, Terminator Warmth, VISION.md
+
+- **Composite mob models** (`entity.rs build_entity_mesh` + `mob_parts`):
+  every mob is now a Minecraft-style multi-box model (body, head, legs; snout/
+  beak accents; 8 legs on spiders; arms on zombies/skeletons) instead of a
+  single cube. Parts are defined in a mob-local (forward, side, up) frame from
+  a data table, tinted from `render_color` with per-part multipliers.
+- **Facing + walk animation**: new `Entity.facing` yaw (0 = +tangent) set from
+  the walk direction, and `Entity.walk_phase` advanced per block walked. The
+  model rotates about the surface normal to face travel; legs (and humanoid
+  arms) swing in opposition with `sin(walk_phase)`. Rotation preserves frame
+  handedness so the CCW-outward winding invariant holds (regression test
+  updated to assert it at multiple facings).
+- **Mob movement fix** (`can_stand_at` + step-up jump): horizontal collision
+  now samples at FEET and HEAD level instead of body center, so mobs stop
+  clipping into 1-block rises; a blocked 1-block step triggers a real jump
+  impulse (`STEP_JUMP_SPEED = 6.8`, apex ~1.16 blocks) instead of the old
+  clip-and-snap teleport that read as constant twitchy "jumping" on slopes.
+  Axis-separated sliding kept as the fallback. New integration test walks a
+  pig over a 1-block step on a real chunk and asserts it ends ON the step.
+- **Terminator warmth** (`shader.wgsl`): `dusk = 4 * daylight * (1-daylight)`
+  peaks mid-transition; sunlight and ambient blend toward warm amber there, so
+  night arrives as a dawn/dusk-colored band sweeping the landscape. Validated
+  with naga.
+- **VISION.md**: new living direction doc (pitch: quiet megastructure
+  survival; pillars; roadmap near/mid/far; art direction notes).
+
+Tests: 217 total (186 ring_world + 31 block_gallery), all passing.
+
