@@ -498,3 +498,20 @@ src/
 | BUG-018 | Medium | Player spawned inside/below terrain; now uses deterministic safe column-scan + AABB clearance spawn/respawn | Fixed |
 | BUG-019 | Medium | Decorative plants rendered as full cubes; now render as double-sided cross billboards | Fixed |
 | BUG-020 | Medium | Texture atlas ignored `textures/` PNGs; now loads PNGs with procedural fallback | Fixed |
+## 2026-08-11 Batch: Sky, Entities, Persistence, World Gen
+
+| Feature | Commit | Status |
+|---------|--------|--------|
+| Water back-to-front sorting (Pass B draws farthest first, fixes blend order) | e2a4662 | ✅ |
+| Sun disk + glow ring billboard at ring center, geometrically eclipsed by shadow squares (depth-write pipeline) | e2a4662 | ✅ |
+| Starfield: 700 stars on camera-following celestial sphere, alpha fades with daylight (0.10 noon to 0.95 night) | e2a4662 | ✅ |
+| Entity rendering: per-mob curved ring-frame boxes through the chunk shader (sun, eclipse, fog apply) | 716b8a8 | ✅ |
+| Daylight-gated hostile spawns (block light < 7 or daylight < 0.3) | 716b8a8 | ✅ |
+| Save/load persistence: versioned binary format, edit overlay + player state + shadow phase, autosave + save on close, no new deps | afc3a4e | ✅ |
+| World gen: seamless ring noise (periodic in theta, no seam at ring wrap) | e511c97 | ✅ |
+| World gen: cross-biome height blending (no cliff walls at biome borders) | e511c97 | ✅ |
+| World gen: continental swell (+/- 4 blocks large-scale variety, occasional islands) | e511c97 | ✅ |
+| World gen: trees generate across the ring seam (wrapped neighbor scan + placement) | e511c97 | ✅ |
+
+Tests: 216 total (185 ring_world + 31 block_gallery), all passing.
+Note: terrain shapes changed vs earlier builds (2D noise became periodic 3D/4D), so saves from before e511c97 will place their edits on different terrain.
