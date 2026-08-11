@@ -755,6 +755,165 @@ fn mob_parts(mob: MobType) -> Vec<MobPart> {
     }
 }
 
+/// The player's own composite model (Steve-style humanoid, 2 blocks tall):
+/// skin head, cyan shirt torso + arms, indigo legs. Same part conventions as
+/// mob_parts (offsets from the feet origin in fwd/side/up blocks).
+fn player_parts() -> Vec<MobPart> {
+    let skin = [0.87, 0.68, 0.53];
+    let shirt = [0.20, 0.65, 0.65];
+    let pants = [0.25, 0.28, 0.55];
+    vec![
+        part([0.0, 0.0, 1.16], [0.14, 0.24, 0.36], shirt, 0.0),
+        part([0.0, 0.0, 1.76], [0.16, 0.16, 0.20], skin, 0.0),
+        part([0.0, 0.33, 1.22], [0.08, 0.08, 0.32], shirt, -1.0),
+        part([0.0, -0.33, 1.22], [0.08, 0.08, 0.32], shirt, 1.0),
+        part([0.0, 0.12, 0.40], [0.09, 0.10, 0.40], pants, 1.0),
+        part([0.0, -0.12, 0.40], [0.09, 0.10, 0.40], pants, -1.0),
+    ]
+}
+
+/// Append one composite model's boxes to a vertex/index list. `feet` is the
+/// world-space ground point under the model's center; (fwd, side, up) is the
+/// model's orthonormal frame (a yaw rotation of the ring frame, so the face
+/// table's CCW-outward winding invariant holds); walk_phase drives limb sway.
+fn emit_parts(
+    parts: &[MobPart],
+    base_color: [f32; 4],
+    feet: [f32; 3],
+    fwd: [f32; 3],
+    side: [f32; 3],
+    up: [f32; 3],
+    walk_phase: f64,
+    vertices: &mut Vec<crate::chunk::ChunkVertex>,
+    indices: &mut Vec<u32>,
+) {
+    use crate::texture::TEX_SNOW;
+
+    let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
+    let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    let neg3 = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+
+    let swing_off = walk_phase.sin() * 0.12;
+
+    for p in parts {
+        let off_f = (p.offset[0] + p.swing * swing_off) as f32;
+        let off_s = p.offset[1] as f32;
+        let off_u = p.offset[2] as f32;
+        let c = add3(
+            add3(feet, scale3(fwd, off_f)),
+            add3(scale3(side, off_s), scale3(up, off_u)),
+        );
+        let hf = p.half[0] as f32;
+        let hs = p.half[1] as f32;
+        let hu = p.half[2] as f32;
+        let color = [
+            base_color[0] * p.color_mul[0],
+            base_color[1] * p.color_mul[1],
+            base_color[2] * p.color_mul[2],
+            base_color[3],
+        ];
+
+        // Each face: (outward normal, u basis, v basis, half-extents)
+        // chosen so u x v points along the normal (CCW-outward winding
+        // for the back-face-culling opaque pipeline).
+        let faces: [([f32; 3], [f32; 3], [f32; 3], f32, f32, f32); 6] = [
+            (fwd, side, up, hf, hs, hu),
+            (neg3(fwd), up, side, hf, hu, hs),
+            (up, fwd, side, hu, hf, hs),
+            (neg3(up), side, fwd, hu, hs, hf),
+            (side, up, fwd, hs, hu, hf),
+            (neg3(side), fwd, up, hs, hf, hu),
+        ];
+
+        for (normal, u, v, n_half, u_half, v_half) in faces.iter() {
+            let fc = add3(c, scale3(*normal, *n_half));
+            let uu = scale3(*u, *u_half);
+            let vv = scale3(*v, *v_half);
+            let corners = [
+                add3(add3(fc, neg3(uu)), neg3(vv)),
+                add3(add3(fc, uu), neg3(vv)),
+                add3(add3(fc, uu), vv),
+                add3(add3(fc, neg3(uu)), vv),
+            ];
+            let uvs = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+            let base = vertices.len() as u32;
+            for (i, corner) in corners.iter().enumerate() {
+                vertices.push(crate::chunk::ChunkVertex {
+                    position: *corner,
+                    normal: *normal,
+                    color,
+                    tex_coords: uvs[i],
+                    tex_index: TEX_SNOW,
+                    light_level: 1.0,
+                    alpha_tested: 0,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+/// Compute the ring-local frame (fwd, side, up) at a theta for a facing yaw,
+/// plus the world-space feet point for a body whose CENTER is at `position`
+/// with total height `body_height`.
+fn model_frame(
+    position: &RingPosition,
+    body_height: f64,
+    facing: f64,
+    config: &RingWorldConfig,
+) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+    let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
+    let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+
+    let theta = position.theta;
+    let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
+    let tangent = [-sin_t, 0.0, cos_t];
+    let up = [-cos_t, 0.0, -sin_t]; // radial-in, toward the sun
+    let axial = [0.0f32, 1.0, 0.0];
+
+    let (sin_f, cos_f) = (facing.sin() as f32, facing.cos() as f32);
+    let fwd = add3(scale3(tangent, cos_f), scale3(axial, sin_f));
+    let side = add3(scale3(tangent, -sin_f), scale3(axial, cos_f));
+
+    let feet_pos = RingPosition::new(
+        position.theta,
+        position.y,
+        position.height - body_height * 0.5,
+    );
+    let feet_cart = feet_pos.to_cartesian(config);
+    let feet = [feet_cart.x as f32, feet_cart.y as f32, feet_cart.z as f32];
+
+    (fwd, side, up, feet)
+}
+
+/// Build the player's own body mesh (third-person view). `position.height`
+/// is the body CENTER (same convention as entities); facing is the camera
+/// yaw in the ring-surface plane (0 = +tangent). World-space vertices: draw
+/// with the identity transform bind group, same pass as entities.
+pub fn build_player_mesh(
+    position: &RingPosition,
+    body_height: f64,
+    facing: f64,
+    walk_phase: f64,
+    config: &RingWorldConfig,
+) -> (Vec<crate::chunk::ChunkVertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let (fwd, side, up, feet) = model_frame(position, body_height, facing, config);
+    emit_parts(
+        &player_parts(),
+        [1.0, 1.0, 1.0, 1.0],
+        feet,
+        fwd,
+        side,
+        up,
+        walk_phase,
+        &mut vertices,
+        &mut indices,
+    );
+    (vertices, indices)
+}
+
 /// Build a renderable world-space mesh for every living entity: a composite
 /// Minecraft-style box model (body, head, limbs) per mob, tinted by
 /// render_color, oriented in the ring's local frame at the entity's theta,
@@ -766,100 +925,27 @@ pub fn build_entity_mesh(
     entities: &[Entity],
     config: &RingWorldConfig,
 ) -> (Vec<crate::chunk::ChunkVertex>, Vec<u32>) {
-    use crate::texture::TEX_SNOW;
-
     let mut vertices: Vec<crate::chunk::ChunkVertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
-    let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
-    let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-    let neg3 = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
-
     for entity in entities.iter().filter(|e| e.alive) {
-        let theta = entity.position.theta;
-        let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
-
-        // Ring-local orthonormal frame at the entity's angle (matches the
-        // curved chunk meshing convention: TRUE tangent).
-        let tangent = [-sin_t, 0.0, cos_t];
-        let up = [-cos_t, 0.0, -sin_t]; // radial-in, toward the sun
-        let axial = [0.0f32, 1.0, 0.0];
-
-        // Rotate (tangent, axial) about `up` by the facing yaw. Rotation
-        // preserves handedness, so the face table below keeps the CCW-outward
-        // winding required by the back-face-culling opaque pipeline.
-        let (sin_f, cos_f) = (entity.facing.sin() as f32, entity.facing.cos() as f32);
-        let fwd = add3(scale3(tangent, cos_f), scale3(axial, sin_f));
-        let side = add3(scale3(tangent, -sin_f), scale3(axial, cos_f));
-
-        // World-space "feet origin": the ground point under the mob's center.
-        let feet_pos = crate::ring_world::RingPosition::new(
-            entity.position.theta,
-            entity.position.y,
-            entity.position.height - entity.mob_height() * 0.5,
+        let (fwd, side, up, feet) = model_frame(
+            &entity.position,
+            entity.mob_height(),
+            entity.facing,
+            config,
         );
-        let feet_cart = feet_pos.to_cartesian(config);
-        let feet = [feet_cart.x as f32, feet_cart.y as f32, feet_cart.z as f32];
-
-        let base_color = entity.render_color();
-        let swing_off = entity.walk_phase.sin() * 0.12;
-
-        for p in mob_parts(entity.mob_type) {
-            let off_f = (p.offset[0] + p.swing * swing_off) as f32;
-            let off_s = p.offset[1] as f32;
-            let off_u = p.offset[2] as f32;
-            let c = add3(
-                add3(feet, scale3(fwd, off_f)),
-                add3(scale3(side, off_s), scale3(up, off_u)),
-            );
-            let hf = p.half[0] as f32;
-            let hs = p.half[1] as f32;
-            let hu = p.half[2] as f32;
-            let color = [
-                base_color[0] * p.color_mul[0],
-                base_color[1] * p.color_mul[1],
-                base_color[2] * p.color_mul[2],
-                base_color[3],
-            ];
-
-            // Each face: (outward normal, u basis, v basis, half-extents)
-            // chosen so u x v points along the normal (CCW-outward winding
-            // for the back-face-culling opaque pipeline).
-            let faces: [([f32; 3], [f32; 3], [f32; 3], f32, f32, f32); 6] = [
-                (fwd, side, up, hf, hs, hu),
-                (neg3(fwd), up, side, hf, hu, hs),
-                (up, fwd, side, hu, hf, hs),
-                (neg3(up), side, fwd, hu, hs, hf),
-                (side, up, fwd, hs, hu, hf),
-                (neg3(side), fwd, up, hs, hf, hu),
-            ];
-
-            for (normal, u, v, n_half, u_half, v_half) in faces.iter() {
-                let fc = add3(c, scale3(*normal, *n_half));
-                let uu = scale3(*u, *u_half);
-                let vv = scale3(*v, *v_half);
-                let corners = [
-                    add3(add3(fc, neg3(uu)), neg3(vv)),
-                    add3(add3(fc, uu), neg3(vv)),
-                    add3(add3(fc, uu), vv),
-                    add3(add3(fc, neg3(uu)), vv),
-                ];
-                let uvs = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-                let base = vertices.len() as u32;
-                for (i, corner) in corners.iter().enumerate() {
-                    vertices.push(crate::chunk::ChunkVertex {
-                        position: *corner,
-                        normal: *normal,
-                        color,
-                        tex_coords: uvs[i],
-                        tex_index: TEX_SNOW,
-                        light_level: 1.0,
-                        alpha_tested: 0,
-                    });
-                }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }
-        }
+        emit_parts(
+            &mob_parts(entity.mob_type),
+            entity.render_color(),
+            feet,
+            fwd,
+            side,
+            up,
+            entity.walk_phase,
+            &mut vertices,
+            &mut indices,
+        );
     }
 
     (vertices, indices)
@@ -996,6 +1082,48 @@ mod tests {
                 let dot = geo[0] * a.normal[0] + geo[1] * a.normal[1] + geo[2] * a.normal[2];
                 assert!(dot > 0.0, "entity face winds against normal at theta {}", theta);
             }
+        }
+    }
+
+    #[test]
+    fn player_mesh_winds_ccw_outward_and_fits_height() {
+        // The player body goes through the same back-face-culled pipeline as
+        // entities: every triangle must wind CCW seen from outside, at
+        // several thetas and facings, and no part may poke below the feet or
+        // above the 2-block body height.
+        let config = crate::ring_world::RingWorldConfig::default();
+        for (theta, facing) in [(0.0f64, 0.0f64), (1.3, 0.9), (3.9, -2.2), (5.7, 3.0)] {
+            let pos = crate::ring_world::RingPosition::new(theta, 2.0, 12.0);
+            let (verts, idx) = super::build_player_mesh(&pos, 2.0, facing, 1.7, &config);
+            assert_eq!(verts.len(), 24 * 6, "6 player parts expected");
+            for tri in idx.chunks(3) {
+                let a = &verts[tri[0] as usize];
+                let b = &verts[tri[1] as usize];
+                let c = &verts[tri[2] as usize];
+                let e1 = [
+                    b.position[0] - a.position[0],
+                    b.position[1] - a.position[1],
+                    b.position[2] - a.position[2],
+                ];
+                let e2 = [
+                    c.position[0] - a.position[0],
+                    c.position[1] - a.position[1],
+                    c.position[2] - a.position[2],
+                ];
+                let geo = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let dot = geo[0] * a.normal[0] + geo[1] * a.normal[1] + geo[2] * a.normal[2];
+                assert!(dot > 0.0, "player face winds against normal at theta {}", theta);
+            }
+        }
+        // Static extents (walk_phase 0): parts stay within [feet, feet+2.0]
+        // along up. Check in part space directly.
+        for p in super::player_parts() {
+            assert!(p.offset[2] - p.half[2] >= -1e-6);
+            assert!(p.offset[2] + p.half[2] <= 2.0 + 1e-6);
         }
     }
 

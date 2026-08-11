@@ -1172,8 +1172,30 @@ impl State {
         );
 
         // Rebuild the entity render mesh (world-space boxes, identity model).
-        let (entity_verts, entity_idx) =
+        let (mut entity_verts, mut entity_idx) =
             crate::entity::build_entity_mesh(&self.entity_manager.entities, &self.ring_config);
+
+        // Third-person: append the player's own body to the same buffers.
+        // Facing = camera yaw projected into the ring-surface plane
+        // (0 = +tangent), so the body turns with the view.
+        if self.player.third_person {
+            let theta = self.player.ring_position.theta;
+            let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
+            let f = self.player.camera.forward();
+            let f_tangent = f.x * -sin_t + f.z * cos_t;
+            let f_axial = f.y;
+            let facing = (f_axial as f64).atan2(f_tangent as f64);
+            let (pv, pi) = crate::entity::build_player_mesh(
+                &self.player.ring_position,
+                2.0, // PLAYER_HEIGHT
+                facing,
+                self.player.walk_phase,
+                &self.ring_config,
+            );
+            let base = entity_verts.len() as u32;
+            entity_verts.extend(pv);
+            entity_idx.extend(pi.into_iter().map(|i| i + base));
+        }
         if entity_idx.is_empty() {
             self.entity_num_indices = 0;
         } else {

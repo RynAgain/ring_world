@@ -19,6 +19,8 @@ const PLAYER_DEPTH: f64 = 0.6;
 const EYE_HEIGHT: f64 = 1.8;
 /// Eye height when crouching
 const CROUCH_EYE_HEIGHT: f64 = 1.5;
+/// Third-person camera distance behind the eye point (blocks).
+const THIRD_PERSON_DIST: f32 = 5.0;
 
 /// Physics constants
 const GRAVITY: f64 = 20.0; // voxels/s^2 (downward = decreasing height)
@@ -138,6 +140,12 @@ pub struct Player {
     pub creative_mode: bool,
     /// Whether the inventory UI is open
     pub inventory_open: bool,
+    /// Third-person camera (F9): render the player's body and pull the
+    /// camera back behind the head.
+    pub third_person: bool,
+    /// Walk-cycle phase in radians, advanced by ground distance walked;
+    /// drives the third-person body's limb swing.
+    pub walk_phase: f64,
     /// Whether the player is flying (creative mode only)
     pub is_flying: bool,
     /// Whether the fly-down key (Shift) is held while flying
@@ -262,6 +270,8 @@ impl Player {
             inventory: Inventory::new(),
             creative_mode: false,
             inventory_open: false,
+            third_person: false,
+            walk_phase: 0.0,
             is_flying: false,
             fly_down: false,
             fly_up: false,
@@ -636,6 +646,13 @@ impl Player {
         // Clamp to ring bounds (theta wraps, y clamps to edges)
         self.ring_position.clamp(config);
 
+        // Advance the walk cycle by the ground distance covered this frame
+        // (third-person body limb swing). Airborne frames freeze the gait.
+        if self.grounded {
+            let walked = (dx * dx + dy * dy + dz * dz).sqrt();
+            self.walk_phase += walked * 7.0;
+        }
+
         // Update camera position from ring position (at eye level).
         // Smooth Camera (v0.4 QoL): lerp the camera toward the target eye
         // position each frame instead of snapping, for smoother movement.
@@ -644,7 +661,19 @@ impl Player {
         let mut eye_pos = self.ring_position;
         eye_pos.height += eye_offset;
         let cart = eye_pos.to_cartesian(config);
-        let target = cgmath::Point3::new(cart.x as f32, cart.y as f32, cart.z as f32);
+        let mut target = cgmath::Point3::new(cart.x as f32, cart.y as f32, cart.z as f32);
+        if self.third_person {
+            // Pull the camera back along the view ray and lift it slightly so
+            // the body reads over the shoulder. (No terrain clip check yet:
+            // walls can briefly occlude the view; acceptable v1.)
+            let back = self.camera.forward() * THIRD_PERSON_DIST;
+            let lift = self.camera.up * 0.6;
+            target = cgmath::Point3::new(
+                target.x - back.x + lift.x,
+                target.y - back.y + lift.y,
+                target.z - back.z + lift.z,
+            );
+        }
         // On the very first frame (camera far from target) snap to avoid a slide.
         let dx = (target.x - self.camera.position.x) as f64;
         let dy = (target.y - self.camera.position.y) as f64;

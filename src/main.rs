@@ -164,6 +164,10 @@ fn main() {
                             (KeyCode::F8, ElementState::Pressed) => {
                                 state.cycle_time_scale();
                             }
+                            // Toggle third-person camera + player body (F9)
+                            (KeyCode::F9, ElementState::Pressed) => {
+                                state.player.third_person = !state.player.third_person;
+                            }
                             // Toggle borderless fullscreen (F11)
                             (KeyCode::F11, ElementState::Pressed) => {
                                 if window.fullscreen().is_some() {
