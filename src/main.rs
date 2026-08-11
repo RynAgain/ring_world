@@ -10,6 +10,7 @@ mod terrain;
 mod structures;
 mod sun;
 mod shadow_squares;
+mod sky;
 mod input;
 mod player;
 mod distant_ring;

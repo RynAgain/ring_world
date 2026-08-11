@@ -16,6 +16,7 @@ use crate::player::{Player, PlacementPreview};
 use crate::lighting::LightingEngine;
 use crate::ring_world::{ChunkCoord, RingPosition, RingWorldConfig, curved_local_to_world};
 use crate::shadow_squares::ShadowSquares;
+use crate::sky::Sky;
 use crate::sun::{Sun, SunUniform};
 use crate::terrain::TerrainGenerator;
 use crate::texture::TextureAtlas;
@@ -186,6 +187,15 @@ pub struct State {
     shadow_vertex_buffer: wgpu::Buffer,
     shadow_index_buffer: wgpu::Buffer,
     shadow_num_indices: u32,
+    /// Dedicated shadow-square pipeline: identical to the distant-ring
+    /// backdrop pipeline but with depth WRITE ON. The squares orbit hundreds
+    /// of units away, so they can never occlude nearby terrain, and their
+    /// written depth is what lets a passing square geometrically eclipse the
+    /// sun disk (drawn after them with depth TEST on).
+    shadow_square_pipeline: wgpu::RenderPipeline,
+
+    /// Sun disk + starfield.
+    sky: Sky,
 
     /// Time-scale multiplier for the day/night cycle (F8 cycles 1x/20x/120x,
     /// for watching the eclipse sweep without waiting 10 minutes).
@@ -573,6 +583,51 @@ impl State {
             multiview: None,
         });
 
+        // Shadow-square pipeline: distant-ring twin with depth WRITE ON (see
+        // field doc). Same shader/layout, so it shares all bind groups.
+        let shadow_square_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Square Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[ChunkVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true, // eclipse: occlude the sun disk
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         // F6 render-diagnostic pipeline: same as the opaque pipeline (depth
         // test + write on, alpha blend) but with back-face culling DISABLED so
         // the diagnostic mode genuinely shows every face regardless of winding.
@@ -757,6 +812,9 @@ impl State {
         });
         let shadow_num_indices = shadow_idx.len() as u32;
 
+        // Sun disk + starfield.
+        let sky = Sky::new(&device, config.format, &camera_bind_group_layout);
+
         // HUD
         let hud = Hud::new(&device, surface_format, size.width, size.height);
 
@@ -790,6 +848,8 @@ impl State {
             shadow_vertex_buffer,
             shadow_index_buffer,
             shadow_num_indices,
+            shadow_square_pipeline,
+            sky,
             time_scale: 1.0,
             distant_ring_transform_bind_group,
             hud,
@@ -918,6 +978,13 @@ impl State {
             &self.shadow_vertex_buffer,
             0,
             bytemuck::cast_slice(&self.shadow_squares.build_vertices()),
+        );
+        // Refresh star alpha (daylight) + sun billboard for the camera.
+        self.sky.update(
+            &self.queue,
+            self.player.camera.position,
+            self.shadow_squares
+                .daylight_at(self.player.ring_position.theta),
         );
 
         // Ensure the chunks around the player are loaded and generated BEFORE
@@ -1771,6 +1838,10 @@ impl State {
                 occlusion_query_set: None,
             });
 
+            // Starfield: deepest background, before everything else. The
+            // distant ring, shadow squares, sun and terrain all paint over it.
+            self.sky.draw_stars(&mut render_pass, &self.camera_bind_group);
+
             // Render distant ring FIRST as a background, using its dedicated
             // depth-WRITE-OFF pipeline. Critical: the distant ring is a full
             // world-radius shell that is coincident with the real loaded chunk
@@ -1790,11 +1861,23 @@ impl State {
 
             // Shadow squares: drawn after the distant ring (they orbit NEARER
             // than the far arch, so they must paint over it) but before the
-            // terrain (depth write off, so real chunks always cover them).
-            // Same pipeline/bind groups as the ring backdrop.
+            // terrain. Their dedicated pipeline WRITES depth: the sun disk is
+            // drawn next with depth TEST on, so a square crossing between the
+            // camera and the ring center visibly eclipses the disk. They are
+            // hundreds of units out, so terrain (drawn later, nearer) always
+            // passes the depth test over them.
+            render_pass.set_pipeline(&self.shadow_square_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.sun_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.distant_ring_transform_bind_group, &[]);
+            render_pass.set_bind_group(3, &self.texture_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.shadow_vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.shadow_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.shadow_num_indices, 0, 0..1);
+
+            // Sun disk + glow: after the squares (their depth eclipses it),
+            // before terrain.
+            self.sky.draw_sun(&mut render_pass, &self.camera_bind_group);
 
             // Now select the chunk pipeline. In F6 render-diagnostic mode use the
             // no-cull pipeline so EVERY face is drawn regardless of winding
@@ -1848,20 +1931,41 @@ impl State {
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_bind_group(1, &self.sun_bind_group, &[]);
             render_pass.set_bind_group(3, &self.texture_bind_group, &[]);
-            for (coord, mesh) in &self.chunk_meshes {
-                if mesh.water_num_indices == 0 {
-                    continue;
-                }
-                if !self.debug_render {
-                    if occluded.contains(coord) {
-                        continue;
+            // Collect visible water chunks and sort BACK-TO-FRONT by distance
+            // from the camera. Alpha blending is order-dependent; HashMap
+            // iteration order is arbitrary AND unstable across frames, which
+            // made overlapping water surfaces blend differently frame to frame
+            // (visible flicker where two water volumes stack in view).
+            let cam = self.player.camera.position;
+            let mut water_draws: Vec<(&ChunkMesh, f32)> = self
+                .chunk_meshes
+                .iter()
+                .filter(|(coord, mesh)| {
+                    if mesh.water_num_indices == 0 {
+                        return false;
                     }
-                    if self.enable_frustum_cull
-                        && !frustum.is_sphere_visible(mesh.center, chunk_radius)
-                    {
-                        continue;
+                    if !self.debug_render {
+                        if occluded.contains(*coord) {
+                            return false;
+                        }
+                        if self.enable_frustum_cull
+                            && !frustum.is_sphere_visible(mesh.center, chunk_radius)
+                        {
+                            return false;
+                        }
                     }
-                }
+                    true
+                })
+                .map(|(_, mesh)| {
+                    let dx = mesh.center[0] - cam.x;
+                    let dy = mesh.center[1] - cam.y;
+                    let dz = mesh.center[2] - cam.z;
+                    (mesh, dx * dx + dy * dy + dz * dz)
+                })
+                .collect();
+            water_draws.sort_by(|a, b| b.1.total_cmp(&a.1)); // farthest first
+
+            for (mesh, _) in water_draws {
                 if let (Some(wvb), Some(wib)) =
                     (&mesh.water_vertex_buffer, &mesh.water_index_buffer)
                 {
