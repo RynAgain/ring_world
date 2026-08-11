@@ -288,8 +288,18 @@ impl TerrainGenerator {
         }
     }
 
-    /// Get the surface voxel type for a biome at a given height
-    fn surface_voxel(&self, biome: Biome, height: i32) -> VoxelType {
+    /// Get the surface voxel type for a biome at a given height.
+    /// Noise coords let the snowline and shorelines wander instead of being
+    /// razor-straight contour lines.
+    fn surface_voxel(&self, biome: Biome, height: i32, noise_x: f64, noise_z: f64) -> VoxelType {
+        // Shoreline: grassy biomes get a sand fringe within a couple blocks
+        // of the water line (lakes and coasts read as beaches everywhere).
+        if height <= SEA_LEVEL as i32 + 2
+            && matches!(biome, Biome::Plains | Biome::Forest | Biome::Mountains)
+        {
+            return VoxelType::Sand;
+        }
+
         match biome {
             Biome::Ocean => {
                 if height < SEA_LEVEL as i32 - 5 {
@@ -302,9 +312,14 @@ impl TerrainGenerator {
             Biome::Plains => VoxelType::Grass,
             Biome::Forest => VoxelType::Grass,
             Biome::Mountains => {
-                if height > 50 {
+                // Jitter the snow and bare-rock lines by +/- a few blocks so
+                // peaks have ragged natural snowlines, not flat contours.
+                let jitter = self.get2(&self.detail_noise, noise_x, noise_z, 0.25);
+                let snow_line = 50.0 + jitter * 4.0;
+                let rock_line = 42.0 + jitter * 3.0;
+                if (height as f64) > snow_line {
                     VoxelType::Snow
-                } else if height > 42 {
+                } else if (height as f64) > rock_line {
                     VoxelType::Stone
                 } else {
                     VoxelType::Grass
@@ -518,21 +533,22 @@ impl TerrainGenerator {
                     let mut voxel_type = if world_height == 0 {
                         VoxelType::Bedrock
                     } else if world_height > effective_terrain_height {
-                        if world_height <= SEA_LEVEL as i32 && (biome == Biome::Ocean || biome == Biome::Beach) {
-                            VoxelType::Water
-                        } else if river_f > 0.0 && world_height <= SEA_LEVEL as i32 {
-                            VoxelType::Water
-                        } else if biome == Biome::Ocean && world_height <= SEA_LEVEL as i32
-                            && world_height == effective_terrain_height + 1
-                        {
-                            let seagrass_val = self.get2(&self.underwater_noise, noise_x, noise_z, 0.8);
-                            if seagrass_val > 0.5 {
-                                VoxelType::Leaves
+                        // ANY biome floods below sea level: blended borders
+                        // and the continental swell dip Plains/Forest/
+                        // Mountains under the water line, and those dips are
+                        // lakes, not dry pits (matches the distant ring's
+                        // water coloring rule).
+                        if world_height <= SEA_LEVEL as i32 {
+                            if biome == Biome::Ocean && world_height == effective_terrain_height + 1 {
+                                let seagrass_val = self.get2(&self.underwater_noise, noise_x, noise_z, 0.8);
+                                if seagrass_val > 0.5 {
+                                    VoxelType::Leaves
+                                } else {
+                                    VoxelType::Water
+                                }
                             } else {
                                 VoxelType::Water
                             }
-                        } else if biome == Biome::Ocean && world_height <= SEA_LEVEL as i32 {
-                            VoxelType::Water
                         } else {
                             VoxelType::Air
                         }
@@ -540,7 +556,7 @@ impl TerrainGenerator {
                         if biome == Biome::Ocean {
                             self.underwater_voxel(noise_x, noise_z, world_height, effective_terrain_height)
                         } else {
-                            self.surface_voxel(biome, world_height)
+                            self.surface_voxel(biome, world_height, noise_x, noise_z)
                         }
                     } else if world_height > effective_terrain_height - 3 {
                         self.subsurface_voxel(biome, world_height)
@@ -640,8 +656,9 @@ impl TerrainGenerator {
                         }
                         let surface_height = terrain_height as i32;
 
-                        // Skip trees on rivers
-                        if river_f > 0.0 {
+                        // Skip trees on rivers and underwater columns
+                        // (universal sea-level flooding makes those lakes).
+                        if river_f > 0.0 || surface_height <= SEA_LEVEL as i32 {
                             continue;
                         }
 
@@ -686,6 +703,11 @@ impl TerrainGenerator {
                 let world_x = coord.ring_index as i32 * chunk_size as i32 + lx as i32;
                 let world_z = coord.width_index as i32 * chunk_size as i32 + lz as i32;
 
+                // No ground decorations underwater (lakes/coasts).
+                if surface_height <= SEA_LEVEL as i32 {
+                    continue;
+                }
+
                 // Tall Grass
                 if biome == Biome::Plains || biome == Biome::Forest {
                     let veg_val = self.get2(&self.vegetation_noise, noise_x, noise_z, 2.0);
@@ -700,10 +722,15 @@ impl TerrainGenerator {
                     }
                 }
 
-                // Flowers (Plains only, ~3%)
-                if biome == Biome::Plains {
+                // Flowers: sparse everywhere grassy (~3% Plains, ~1%
+                // Forest), plus dense meadow patches in Plains where a low
+                // frequency noise field crests (visible flower fields).
+                if biome == Biome::Plains || biome == Biome::Forest {
                     let flower_hash = Self::position_hash(world_x, world_z, self.seed.wrapping_add(666));
-                    if flower_hash % 33 == 0 {
+                    let base_rate = if biome == Biome::Plains { 33 } else { 90 };
+                    let meadow = biome == Biome::Plains
+                        && self.get2(&self.vegetation_noise, noise_x, noise_z, 0.35) > 0.55;
+                    if flower_hash % base_rate == 0 || (meadow && flower_hash % 4 == 0) {
                         let above_height = surface_height + 1;
                         self.place_ground_decoration(chunk, config, lx, lz, above_height, VoxelType::Flower, VoxelType::Grass);
                     }
@@ -1078,6 +1105,79 @@ mod tests {
                         c2.get_voxel(x, y, z).voxel_type,
                         "mismatch at ({},{},{})", x, y, z
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shoreline_grassy_biomes_get_sand_fringe() {
+        let terrain = TerrainGenerator::new(42);
+        for biome in [Biome::Plains, Biome::Forest, Biome::Mountains] {
+            let v = terrain.surface_voxel(biome, SEA_LEVEL as i32 + 1, 3.0, 0.5);
+            assert_eq!(v, VoxelType::Sand, "{:?} at waterline should be sand", biome);
+            let v_high = terrain.surface_voxel(biome, SEA_LEVEL as i32 + 8, 3.0, 0.5);
+            assert_ne!(v_high, VoxelType::Sand, "{:?} well above waterline", biome);
+        }
+    }
+
+    #[test]
+    fn snowline_is_jittered_but_deterministic() {
+        let terrain = TerrainGenerator::new(42);
+        // Same coords, same result (determinism).
+        let a = terrain.surface_voxel(Biome::Mountains, 52, 1.0, 1.0);
+        let b = terrain.surface_voxel(Biome::Mountains, 52, 1.0, 1.0);
+        assert_eq!(a, b);
+        // Far above any jitter: always snow. Far below: never snow.
+        assert_eq!(terrain.surface_voxel(Biome::Mountains, 60, 2.0, 2.0), VoxelType::Snow);
+        assert_ne!(terrain.surface_voxel(Biome::Mountains, 40, 2.0, 2.0), VoxelType::Snow);
+    }
+
+    #[test]
+    fn below_sea_level_columns_flood_in_any_biome() {
+        // Generate a strip of chunks and assert NO column anywhere contains
+        // air at/below sea level above its terrain surface: every sub-sea
+        // void must be water (lakes rule).
+        let config = RingWorldConfig::default();
+        let terrain = TerrainGenerator::new(42);
+        let size = config.chunk_size;
+        for ring in [0u32, 7, 19, 40] {
+            let height_index = SEA_LEVEL / size; // chunk layer containing sea level
+            let coord = ChunkCoord::new(ring, 1, height_index);
+            let mut chunk = Chunk::new(coord, size);
+            terrain.generate_chunk(&mut chunk, &config);
+            for lx in 0..size {
+                for lz in 0..size {
+                    for ly in 0..size {
+                        let wh = (height_index * size + ly) as i32;
+                        if wh > SEA_LEVEL as i32 {
+                            continue;
+                        }
+                        let v = chunk.get_voxel(lx, ly, lz).voxel_type;
+                        if v == VoxelType::Air {
+                            // Air at/below sea level is only legal underground
+                            // (caves/ravines sit beneath solid ground, i.e.
+                            // some solid voxel must exist above in this
+                            // column-slice or the surface is above sea level).
+                            let mut covered = false;
+                            for ly2 in (ly + 1)..size {
+                                let v2 = chunk.get_voxel(lx, ly2, lz).voxel_type;
+                                if v2 != VoxelType::Air && v2 != VoxelType::Water {
+                                    covered = true;
+                                    break;
+                                }
+                            }
+                            let (wt, wy) = terrain.local_to_world(lx, lz, &coord, &config);
+                            let nx = wt * config.radius * 0.01;
+                            let nz = wy * 0.01;
+                            let th = terrain.blended_terrain_height(nx, nz);
+                            assert!(
+                                covered || th > SEA_LEVEL as f64,
+                                "open-air void below sea level at ring {} ({},{},{})",
+                                ring, lx, ly, lz
+                            );
+                        }
+                    }
                 }
             }
         }

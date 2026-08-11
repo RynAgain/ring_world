@@ -31,6 +31,7 @@ All bindings verified against `src/main.rs` and `src/camera.rs`.
 | E | Toggle inventory |
 | C | Toggle crafting (needs a crafting table within 3 blocks for full recipes) |
 | Escape | Release the mouse cursor / regain it by clicking |
+| F9 | Toggle third-person camera (renders your body) |
 | F11 | Toggle borderless fullscreen |
 
 ## Game Modes & Time

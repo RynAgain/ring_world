@@ -545,3 +545,34 @@ Note: terrain shapes changed vs earlier builds (2D noise became periodic 3D/4D),
 
 Tests: 217 total (186 ring_world + 31 block_gallery), all passing.
 
+## 2026-08-11 Batch 3: Player Body, Distant Ring Relief, Biome Pass
+
+- **Third-person player body (F9)**: humanoid composite model (skin head,
+  cyan shirt torso + arms, indigo legs) rendered through the shared
+  `emit_parts` path (refactored out of `build_entity_mesh` with a
+  `model_frame` helper). Faces the camera yaw; limbs swing with ground
+  distance walked (`Player.walk_phase`, frozen while airborne). Camera pulls
+  back 5 blocks with a 0.6 lift. Known v1 limitation: no terrain clip check
+  on the camera ray. Winding + extents test added.
+- **Distant ring relief** (`build_inner_surface`, pure + tested): the arch
+  overhead is now a real heightmap. Vertices displaced inward by sampled
+  terrain height (oceans held flat at sea level), finite-difference normals
+  so mountain relief on the arch catches sun light, seam-closed by sampling
+  the wrap row at theta = 0, tessellation 128x16 -> 1024x24, depth-shaded
+  water colors for any biome below sea level, noise mottling breaks banding.
+  The sky is becoming a map (VISION mid-term item).
+- **Biome pass** (`terrain.rs`):
+  - Universal sea-level flooding: any biome column below SEA_LEVEL fills
+    with water, turning blended-border dips and continental-swell lows into
+    real lakes instead of dry pits (test scans generated chunks for illegal
+    open-air voids).
+  - Shoreline sand fringe: Plains/Forest/Mountains surfaces within 2 blocks
+    of the waterline become sand, so every lake and coast has a beach.
+  - Jittered snowline: mountain snow (~50) and bare-rock (~42) lines wander
+    +/- 3-4 blocks by noise instead of razor-straight contours.
+  - Vegetation: no trees or ground decorations underwater; Forest gets
+    sparse flowers (~1%); Plains gets dense meadow flower patches where a
+    low-frequency noise field crests.
+
+Tests: 222 total (191 ring_world + 31 block_gallery), all passing.
+
