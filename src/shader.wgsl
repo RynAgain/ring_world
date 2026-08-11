@@ -215,18 +215,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Diffuse lighting (fully eclipsed by shadow squares)
     let diff = max(dot(normal, to_sun), 0.0);
-    let diffuse = sun.color.rgb * sun.color.a * diff * daylight;
+    // Terminator warmth: while a shadow-square edge sweeps past (daylight in
+    // mid-range) sunlight reddens like a fast dawn/dusk, so night arrives as
+    // a warm amber band crossing the landscape instead of a neutral fade.
+    // dusk peaks at 1.0 when daylight = 0.5 and is 0 at full day/full night.
+    let dusk = 4.0 * daylight * (1.0 - daylight);
+    let sun_rgb = mix(sun.color.rgb, vec3<f32>(1.0, 0.45, 0.25), dusk * 0.55);
+    let diffuse = sun_rgb * sun.color.a * diff * daylight;
     
     // Ambient lighting (high on a ring world due to reflected light from the
     // opposite side). At night most of that reflected light is gone too, but
     // the lit arch overhead keeps a floor of ~18% so night is moody, not void.
-    let ambient = sun.ambient.rgb * mix(0.18, 1.0, daylight);
+    let ambient = sun.ambient.rgb * mix(0.18, 1.0, daylight)
+        * mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(1.08, 0.92, 0.78), dusk * 0.5);
     
     // Simple specular
     let view_dir = normalize(camera.view_position.xyz - in.world_position);
     let reflect_dir = reflect(-to_sun, normal);
     let spec = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0);
-    let specular = sun.color.rgb * spec * 0.2 * daylight;
+    let specular = sun_rgb * spec * 0.2 * daylight;
     
     // Combine directional lighting with base color
     let directional_lighting = ambient + diffuse + specular;
