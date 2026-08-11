@@ -98,8 +98,13 @@ pub struct TerrainGenerator {
     underwater_noise: Perlin,
     tree_noise: Perlin,
     vegetation_noise: Perlin,
+    continent_noise: Perlin,
     structure_generator: StructureGenerator,
     seed: u32,
+    /// Radius (in noise units) of the circle the linear noise_x coordinate is
+    /// wrapped onto, making all noise periodic in theta. Equals ring radius *
+    /// 0.01 (the noise coordinate scale), so the period matches theta's 2*PI.
+    noise_circle_radius: f64,
 }
 
 impl TerrainGenerator {
@@ -120,16 +125,50 @@ impl TerrainGenerator {
             underwater_noise: Perlin::new(seed.wrapping_add(800)),
             tree_noise: Perlin::new(seed.wrapping_add(900)),
             vegetation_noise: Perlin::new(seed.wrapping_add(1000)),
+            continent_noise: Perlin::new(seed.wrapping_add(1100)),
             structure_generator: StructureGenerator::new(seed),
             seed,
+            noise_circle_radius: RingWorldConfig::default().radius * 0.01,
         }
+    }
+
+    /// Map the linear circumferential noise coordinate onto a circle so every
+    /// noise sample is periodic in theta. The ring seam (theta wrapping from
+    /// 2*PI back to 0) previously produced a hard discontinuity in biomes and
+    /// terrain because noise_x jumped from its maximum back to zero. Sampling
+    /// on a circle whose arc length equals the linear coordinate keeps feature
+    /// sizes identical everywhere while making the seam invisible.
+    fn circle_coords(&self, noise_x: f64) -> (f64, f64) {
+        let ang = noise_x / self.noise_circle_radius;
+        (
+            self.noise_circle_radius * ang.cos(),
+            self.noise_circle_radius * ang.sin(),
+        )
+    }
+
+    /// Periodic 2D noise sample at the given frequency.
+    fn get2(&self, noise: &Perlin, noise_x: f64, noise_z: f64, freq: f64) -> f64 {
+        let (cx, cy) = self.circle_coords(noise_x);
+        noise.get([cx * freq, cy * freq, noise_z * freq])
+    }
+
+    /// Periodic 3D (adds height) noise sample at the given frequency.
+    fn get3(&self, noise: &Perlin, noise_x: f64, noise_z: f64, h: f64, freq: f64) -> f64 {
+        let (cx, cy) = self.circle_coords(noise_x);
+        noise.get([cx * freq, cy * freq, noise_z * freq, h * freq])
+    }
+
+    /// The combined biome-selection scalar. Biome thresholds and the height
+    /// blend both read this same value so they can never disagree.
+    fn biome_scalar(&self, noise_x: f64, noise_z: f64) -> f64 {
+        let biome_val = self.get2(&self.biome_noise, noise_x, noise_z, 0.03);
+        let biome_detail = self.get2(&self.biome_detail_noise, noise_x, noise_z, 0.05);
+        biome_val * 0.7 + biome_detail * 0.3
     }
 
     /// Determine the biome at a given noise coordinate
     pub fn sample_biome(&self, noise_x: f64, noise_z: f64) -> Biome {
-        let biome_val = self.biome_noise.get([noise_x * 0.03, noise_z * 0.03]);
-        let biome_detail = self.biome_detail_noise.get([noise_x * 0.05, noise_z * 0.05]);
-        let combined = biome_val * 0.7 + biome_detail * 0.3;
+        let combined = self.biome_scalar(noise_x, noise_z);
 
         if combined < -0.5 {
             Biome::Ocean
@@ -148,9 +187,9 @@ impl TerrainGenerator {
 
     /// Get terrain height based on biome
     fn biome_terrain_height(&self, noise_x: f64, noise_z: f64, biome: Biome) -> f64 {
-        let hills = self.terrain_noise.get([noise_x * 0.1, noise_z * 0.1]) * 0.5 + 0.5;
-        let bumps = self.detail_noise.get([noise_x * 0.4, noise_z * 0.4]) * 0.5 + 0.5;
-        let detail = self.terrain_noise.get([noise_x * 1.5, noise_z * 1.5]) * 0.5 + 0.5;
+        let hills = self.get2(&self.terrain_noise, noise_x, noise_z, 0.1) * 0.5 + 0.5;
+        let bumps = self.get2(&self.detail_noise, noise_x, noise_z, 0.4) * 0.5 + 0.5;
+        let detail = self.get2(&self.terrain_noise, noise_x, noise_z, 1.5) * 0.5 + 0.5;
 
         match biome {
             Biome::Ocean => {
@@ -180,12 +219,58 @@ impl TerrainGenerator {
         }
     }
 
+    /// Band centers for the biome-selection scalar. The height blend
+    /// interpolates between the two bracketing biomes' height profiles so
+    /// biome borders are slopes instead of vertical cliff walls (each biome's
+    /// raw height range is disjoint, e.g. Ocean tops out near 22 where Beach
+    /// starts, and Mountains reach 58 next to Desert's 34).
+    const BIOME_BANDS: [(f64, Biome); 6] = [
+        (-0.65, Biome::Ocean),
+        (-0.40, Biome::Beach),
+        (-0.15, Biome::Plains),
+        (0.15, Biome::Forest),
+        (0.45, Biome::Mountains),
+        (0.75, Biome::Desert),
+    ];
+
+    /// Terrain height with cross-biome blending plus a very low frequency
+    /// continental swell (about +/- 4 blocks) for large-scale elevation
+    /// variety (rolling coastlines, occasional small ocean islands).
+    fn blended_terrain_height(&self, noise_x: f64, noise_z: f64) -> f64 {
+        let t = self.biome_scalar(noise_x, noise_z);
+        let bands = Self::BIOME_BANDS;
+
+        let mut height = if t <= bands[0].0 {
+            self.biome_terrain_height(noise_x, noise_z, bands[0].1)
+        } else if t >= bands[bands.len() - 1].0 {
+            self.biome_terrain_height(noise_x, noise_z, bands[bands.len() - 1].1)
+        } else {
+            let mut h = 0.0;
+            for i in 0..bands.len() - 1 {
+                let (c0, b0) = bands[i];
+                let (c1, b1) = bands[i + 1];
+                if t >= c0 && t <= c1 {
+                    let u = (t - c0) / (c1 - c0);
+                    let u = u * u * (3.0 - 2.0 * u); // smoothstep
+                    let h0 = self.biome_terrain_height(noise_x, noise_z, b0);
+                    let h1 = self.biome_terrain_height(noise_x, noise_z, b1);
+                    h = h0 * (1.0 - u) + h1 * u;
+                    break;
+                }
+            }
+            h
+        };
+
+        height += self.get2(&self.continent_noise, noise_x, noise_z, 0.008) * 4.0;
+        height.clamp(3.0, 62.0)
+    }
+
     /// Check if a position is a river location
     fn is_river(&self, noise_x: f64, noise_z: f64, biome: Biome) -> bool {
         if biome != Biome::Plains && biome != Biome::Forest {
             return false;
         }
-        let river_val = self.river_noise.get([noise_x * 0.01, noise_z * 0.01]);
+        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.01);
         river_val.abs() < 0.015
     }
 
@@ -194,7 +279,7 @@ impl TerrainGenerator {
         if biome != Biome::Plains && biome != Biome::Forest {
             return 0.0;
         }
-        let river_val = self.river_noise.get([noise_x * 0.01, noise_z * 0.01]);
+        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.01);
         let abs_val = river_val.abs();
         if abs_val < 0.015 {
             1.0 - (abs_val / 0.015)
@@ -250,17 +335,9 @@ impl TerrainGenerator {
 
         let height_factor = 1.0 - (height as f64 / 64.0) * 0.4;
 
-        let cave_val = self.cave_noise.get([
-            noise_x * 0.05,
-            noise_z * 0.05,
-            height as f64 * 0.05,
-        ]);
+        let cave_val = self.get3(&self.cave_noise, noise_x, noise_z, height as f64, 0.05);
 
-        let cave_val_2 = self.cave_noise_2.get([
-            noise_x * 0.1,
-            noise_z * 0.1,
-            height as f64 * 0.1,
-        ]);
+        let cave_val_2 = self.get3(&self.cave_noise_2, noise_x, noise_z, height as f64, 0.1);
 
         let threshold_1 = 0.6 - (1.0 - height_factor) * 0.15;
         let threshold_2 = 0.5 - (1.0 - height_factor) * 0.1;
@@ -274,7 +351,7 @@ impl TerrainGenerator {
             return false;
         }
 
-        let ravine_val = self.ravine_noise.get([noise_x * 0.08, noise_z * 0.08]);
+        let ravine_val = self.get2(&self.ravine_noise, noise_x, noise_z, 0.08);
 
         if ravine_val.abs() < 0.02 {
             let ravine_bottom = (terrain_height - 15).max(5);
@@ -287,33 +364,21 @@ impl TerrainGenerator {
     /// Determine ore type at a position (returns None if no ore)
     fn sample_ore(&self, noise_x: f64, noise_z: f64, height: i32) -> Option<VoxelType> {
         if height >= 5 && height <= 15 {
-            let diamond_val = self.ore_diamond_noise.get([
-                noise_x * 0.15,
-                noise_z * 0.15,
-                height as f64 * 0.15,
-            ]);
+            let diamond_val = self.get3(&self.ore_diamond_noise, noise_x, noise_z, height as f64, 0.15);
             if diamond_val > 0.85 {
                 return Some(VoxelType::DiamondOre);
             }
         }
 
         if height >= 5 && height <= 30 {
-            let gold_val = self.ore_gold_noise.get([
-                noise_x * 0.12,
-                noise_z * 0.12,
-                height as f64 * 0.12,
-            ]);
+            let gold_val = self.get3(&self.ore_gold_noise, noise_x, noise_z, height as f64, 0.12);
             if gold_val > 0.78 {
                 return Some(VoxelType::GoldOre);
             }
         }
 
         if height >= 5 && height <= 45 {
-            let iron_val = self.ore_iron_noise.get([
-                noise_x * 0.1,
-                noise_z * 0.1,
-                height as f64 * 0.1,
-            ]);
+            let iron_val = self.get3(&self.ore_iron_noise, noise_x, noise_z, height as f64, 0.1);
             if iron_val > 0.65 {
                 return Some(VoxelType::IronOre);
             }
@@ -328,11 +393,7 @@ impl TerrainGenerator {
             return false;
         }
 
-        let overhang_val = self.overhang_noise.get([
-            noise_x * 0.15,
-            noise_z * 0.15,
-            height as f64 * 0.15,
-        ]);
+        let overhang_val = self.get3(&self.overhang_noise, noise_x, noise_z, height as f64, 0.15);
 
         overhang_val > 0.7
     }
@@ -343,8 +404,8 @@ impl TerrainGenerator {
             return VoxelType::Sand;
         }
 
-        let detail_val = self.underwater_noise.get([noise_x * 0.2, noise_z * 0.2]);
-        let detail_val_2 = self.underwater_noise.get([noise_x * 0.5, noise_z * 0.5]);
+        let detail_val = self.get2(&self.underwater_noise, noise_x, noise_z, 0.2);
+        let detail_val_2 = self.get2(&self.underwater_noise, noise_x, noise_z, 0.5);
 
         if detail_val > 0.4 {
             VoxelType::Gravel
@@ -375,7 +436,7 @@ impl TerrainGenerator {
             _ => return 0,
         };
 
-        let tree_val = self.tree_noise.get([noise_x * 0.5, noise_z * 0.5]);
+        let tree_val = self.get2(&self.tree_noise, noise_x, noise_z, 0.5);
         if tree_val < threshold {
             return 0;
         }
@@ -430,7 +491,7 @@ impl TerrainGenerator {
                 let noise_z = world_y * 0.01;
                 let biome = self.sample_biome(noise_x, noise_z);
 
-                let mut terrain_height = self.biome_terrain_height(noise_x, noise_z, biome);
+                let mut terrain_height = self.blended_terrain_height(noise_x, noise_z);
 
                 let river_f = self.river_factor(noise_x, noise_z, biome);
                 if river_f > 0.0 {
@@ -444,7 +505,7 @@ impl TerrainGenerator {
                 let terrain_height_i = terrain_height as i32;
 
                 let ocean_floor_offset = if biome == Biome::Ocean {
-                    let extra_depth = self.underwater_noise.get([noise_x * 0.08, noise_z * 0.08]);
+                    let extra_depth = self.get2(&self.underwater_noise, noise_x, noise_z, 0.08);
                     (extra_depth * 4.0) as i32
                 } else {
                     0
@@ -464,7 +525,7 @@ impl TerrainGenerator {
                         } else if biome == Biome::Ocean && world_height <= SEA_LEVEL as i32
                             && world_height == effective_terrain_height + 1
                         {
-                            let seagrass_val = self.underwater_noise.get([noise_x * 0.8, noise_z * 0.8]);
+                            let seagrass_val = self.get2(&self.underwater_noise, noise_x, noise_z, 0.8);
                             if seagrass_val > 0.5 {
                                 VoxelType::Leaves
                             } else {
@@ -544,10 +605,13 @@ impl TerrainGenerator {
         // Handle trees from this chunk and neighboring chunks (trees can extend across boundaries)
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
-                let neighbor_ring = coord.ring_index as i32 + dx;
+                // Wrap the ring index so trees generate (and overhang) across
+                // the ring seam; width is a true world edge, so bound it.
+                let circ = config.chunks_circumference as i32;
+                let neighbor_ring = (coord.ring_index as i32 + dx).rem_euclid(circ);
                 let neighbor_width = coord.width_index as i32 + dz;
 
-                if neighbor_ring < 0 || neighbor_width < 0 {
+                if neighbor_width < 0 || neighbor_width >= config.chunks_width as i32 {
                     continue;
                 }
 
@@ -566,7 +630,7 @@ impl TerrainGenerator {
                         let noise_z = world_y * 0.01;
                         let biome = self.sample_biome(noise_x, noise_z);
 
-                        let mut terrain_height = self.biome_terrain_height(noise_x, noise_z, biome);
+                        let mut terrain_height = self.blended_terrain_height(noise_x, noise_z);
                         let river_f = self.river_factor(noise_x, noise_z, biome);
                         if river_f > 0.0 {
                             terrain_height -= 3.0 + river_f * 2.0;
@@ -609,7 +673,7 @@ impl TerrainGenerator {
                 let noise_z = world_y * 0.01;
                 let biome = self.sample_biome(noise_x, noise_z);
 
-                let mut terrain_height = self.biome_terrain_height(noise_x, noise_z, biome);
+                let mut terrain_height = self.blended_terrain_height(noise_x, noise_z);
                 let river_f = self.river_factor(noise_x, noise_z, biome);
                 if river_f > 0.0 {
                     terrain_height -= 3.0 + river_f * 2.0;
@@ -624,7 +688,7 @@ impl TerrainGenerator {
 
                 // Tall Grass
                 if biome == Biome::Plains || biome == Biome::Forest {
-                    let veg_val = self.vegetation_noise.get([noise_x * 2.0, noise_z * 2.0]);
+                    let veg_val = self.get2(&self.vegetation_noise, noise_x, noise_z, 2.0);
                     let threshold = match biome {
                         Biome::Plains => 0.35,
                         Biome::Forest => 0.55,
@@ -841,11 +905,14 @@ impl TerrainGenerator {
         let chunk_world_z = coord.width_index as i32 * chunk_size;
         let chunk_world_y = coord.height_index as i32 * chunk_size;
 
-        let lx = world_x - chunk_world_x;
+        // Wrap the circumferential delta so a tree rooted just past the ring
+        // seam can still place its overhanging blocks into this chunk.
+        let circ_blocks = config.chunks_circumference as i32 * chunk_size;
+        let lx = (world_x - chunk_world_x).rem_euclid(circ_blocks);
         let lz = world_z - chunk_world_z;
         let ly = world_y - chunk_world_y;
 
-        if lx < 0 || lx >= chunk_size || lz < 0 || lz >= chunk_size || ly < 0 || ly >= chunk_size {
+        if lx >= chunk_size || lz < 0 || lz >= chunk_size || ly < 0 || ly >= chunk_size {
             return;
         }
 
@@ -853,7 +920,6 @@ impl TerrainGenerator {
         if current == VoxelType::Air {
             chunk.set_voxel(lx as u32, ly as u32, lz as u32, Voxel::new(voxel_type));
         }
-        let _ = config; // suppress unused warning
     }
 
     /// Try to place a leaf block (only replaces Air, not Wood or other solid blocks)
@@ -863,8 +929,7 @@ impl TerrainGenerator {
 
     /// Sample terrain height at a noise coordinate (public for distant ring use)
     pub fn sample_terrain_height(&self, noise_x: f64, noise_z: f64, _config: &RingWorldConfig) -> f64 {
-        let biome = self.sample_biome(noise_x, noise_z);
-        self.biome_terrain_height(noise_x, noise_z, biome)
+        self.blended_terrain_height(noise_x, noise_z)
     }
 
     /// Sample terrain color at a given ring position (theta, y) for distant ring rendering
@@ -873,7 +938,7 @@ impl TerrainGenerator {
         let noise_z = y * 0.01;
 
         let biome = self.sample_biome(noise_x, noise_z);
-        let height = self.biome_terrain_height(noise_x, noise_z, biome);
+        let height = self.blended_terrain_height(noise_x, noise_z);
 
         if height < SEA_LEVEL as f64 && (biome == Biome::Ocean || biome == Biome::Beach) {
             return [0.15, 0.3, 0.7, 1.0];
@@ -998,6 +1063,53 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn terrain_and_biome_continuous_across_ring_seam() {
+        // theta = 0 and theta = 2*PI are the same physical place on the ring;
+        // heights and biomes sampled through the noise-coordinate convention
+        // (noise_x = theta * radius * 0.01) must agree exactly.
+        let config = RingWorldConfig::default();
+        let g = TerrainGenerator::new(42);
+        let seam_x = std::f64::consts::TAU * config.radius * 0.01;
+        for &y in &[-30.0f64, -5.0, 0.0, 12.5, 30.0] {
+            let nz = y * 0.01;
+            let a = g.sample_terrain_height(0.0, nz, &config);
+            let b = g.sample_terrain_height(seam_x, nz, &config);
+            assert!(
+                (a - b).abs() < 1e-6,
+                "height seam mismatch at y={}: {} vs {}", y, a, b
+            );
+            assert_eq!(
+                g.sample_biome(0.0, nz),
+                g.sample_biome(seam_x, nz),
+                "biome seam mismatch at y={}", y
+            );
+        }
+    }
+
+    #[test]
+    fn terrain_height_has_no_biome_cliff_walls() {
+        // Walking along the ring, adjacent columns (2 blocks apart = 0.02
+        // noise units) must never differ by a cliff-wall jump. Before the
+        // height blend, crossing a biome threshold could jump 10+ blocks in
+        // one step (e.g. Mountains base 30 next to Desert base 26 with very
+        // different amplitudes).
+        let config = RingWorldConfig::default();
+        let g = TerrainGenerator::new(42);
+        let step = 0.02;
+        let mut prev = g.sample_terrain_height(0.0, 0.0, &config);
+        let mut x = step;
+        while x < 41.0 {
+            let h = g.sample_terrain_height(x, 0.0, &config);
+            assert!(
+                (h - prev).abs() < 3.0,
+                "cliff wall at noise_x {}: {} -> {}", x, prev, h
+            );
+            prev = h;
+            x += step;
         }
     }
 
