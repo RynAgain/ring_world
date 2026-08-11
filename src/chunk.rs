@@ -1233,6 +1233,11 @@ pub struct ChunkManager {
     config: RingWorldConfig,
     /// Render distance in chunks (Chebyshev radius)
     render_distance: u32,
+    /// Persistent player-edit overlay: chunk -> (local voxel index -> type).
+    /// Terrain is deterministic from the seed, so this overlay is the ONLY
+    /// world state that needs to survive chunk unloads and be saved to disk.
+    /// Re-applied after a chunk regenerates (see `apply_edits`).
+    pub edits: std::collections::HashMap<ChunkCoord, std::collections::HashMap<u16, VoxelType>>,
 }
 
 impl ChunkManager {
@@ -1241,6 +1246,7 @@ impl ChunkManager {
             chunks: std::collections::HashMap::new(),
             config,
             render_distance,
+            edits: std::collections::HashMap::new(),
         }
     }
 
@@ -1288,6 +1294,12 @@ impl ChunkManager {
         if !edited {
             return false;
         }
+
+        // Record the edit in the persistent overlay so it survives chunk
+        // unload/reload and is written to the save file. Index formula must
+        // match `Chunk::index`.
+        let idx = (x + y * size + z * size * size) as u16;
+        self.edits.entry(*coord).or_default().insert(idx, voxel.voxel_type);
 
         // Mark boundary-adjacent neighbors dirty. A voxel may touch up to three
         // neighbor chunks at once (a corner), so check each axis independently.
@@ -1346,6 +1358,19 @@ impl ChunkManager {
         // Load chunks that are wanted but not yet present.
         for coord in wanted {
             self.chunks.entry(coord).or_insert_with(|| Chunk::new(coord, size));
+        }
+    }
+
+    /// Re-apply this chunk's recorded player edits on top of freshly
+    /// generated terrain. Call after `TerrainGenerator::generate_chunk` and
+    /// BEFORE lighting, so torches placed by the player light up again.
+    pub fn apply_edits(&self, chunk: &mut Chunk) {
+        if let Some(map) = self.edits.get(&chunk.coord) {
+            let size = chunk.size();
+            for (&idx, &vt) in map {
+                let i = idx as u32;
+                chunk.set_voxel(i % size, (i / size) % size, i / (size * size), Voxel::new(vt));
+            }
         }
     }
 
@@ -2245,6 +2270,34 @@ mod tests {
     /// from the player's viewpoint. Editing an interior voxel must NOT dirty any
     /// neighbor. This is the regression guard for the "broken/placed face at a
     /// chunk seam doesn't update" bug.
+    #[test]
+    fn edit_overlay_survives_chunk_regeneration() {
+        // A player edit recorded via ChunkManager::set_voxel must be
+        // re-applicable onto a freshly regenerated (blank) chunk.
+        let config = RingWorldConfig::default();
+        let size = config.chunk_size;
+        let coord = ChunkCoord::new(2, 1, 0);
+        let mut mgr = ChunkManager::new(config, 2);
+        mgr.chunks.insert(coord, Chunk::new(coord, size));
+
+        assert!(mgr.set_voxel(&coord, 5, 6, 7, Voxel::new(VoxelType::Torch)));
+        assert!(mgr.set_voxel(&coord, 0, 0, 0, Voxel::air()));
+
+        // Simulate unload + regeneration: a brand-new blank chunk.
+        let mut fresh = Chunk::new(coord, size);
+        fresh.set_voxel(0, 0, 0, Voxel::new(VoxelType::Stone)); // "terrain"
+        mgr.apply_edits(&mut fresh);
+
+        assert_eq!(fresh.get_voxel(5, 6, 7).voxel_type, VoxelType::Torch);
+        // The air edit (block removal) overrides generated terrain.
+        assert!(fresh.get_voxel(0, 0, 0).is_air());
+        // Chunks without recorded edits are untouched.
+        let other = ChunkCoord::new(9, 0, 0);
+        let mut untouched = Chunk::new(other, size);
+        mgr.apply_edits(&mut untouched);
+        assert!(untouched.is_empty());
+    }
+
     #[test]
     fn chunk_manager_set_voxel_dirties_boundary_neighbor() {
         let config = RingWorldConfig::default();

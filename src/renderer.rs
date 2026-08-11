@@ -1,6 +1,9 @@
 /// Renderer module - wgpu-based rendering pipeline for the ring world
 
 use std::collections::HashMap;
+
+/// Seconds between periodic world autosaves.
+const AUTOSAVE_INTERVAL_SECS: f32 = 60.0;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -224,6 +227,13 @@ pub struct State {
     // spawn-area chunks finished generating (prevents falling through
     // ungenerated terrain on the first frames).
     spawn_settled: bool,
+
+    /// Exact position to restore the player to after loading a save, applied
+    /// once the chunk they occupy has regenerated (with edits re-applied).
+    restored_position: Option<RingPosition>,
+
+    /// Seconds since the last autosave.
+    autosave_timer: f32,
 
     /// Whether the debug overlay is visible (toggled with F3).
     pub debug_visible: bool,
@@ -839,7 +849,7 @@ impl State {
         // HUD
         let hud = Hud::new(&device, surface_format, size.width, size.height);
 
-        Self {
+        let mut state = Self {
             surface,
             device,
             queue,
@@ -883,6 +893,8 @@ impl State {
             highlight_index_buffer,
             highlight_num_indices: 0,
             spawn_settled: false,
+            restored_position: None,
+            autosave_timer: 0.0,
             debug_visible: false,
             enable_frustum_cull: true,
             enable_occlusion_cull: false,
@@ -891,7 +903,104 @@ impl State {
             render_distance: 8,
             rendered_chunks: 0,
             fps_smoothed: 0.0,
+        };
+
+        // Restore a previous session if a save file exists. A corrupt or
+        // missing file just means a fresh world.
+        if let Some(save) = crate::persistence::WorldSave::read_from(crate::persistence::SAVE_PATH) {
+            state.apply_save(save);
+            log::info!("Loaded world from {}", crate::persistence::SAVE_PATH);
         }
+
+        state
+    }
+
+    /// Persist the current session to disk (player, day phase, edit overlay).
+    /// Skipped until the spawn has settled so the pre-settle ceiling position
+    /// from the first frames is never written out.
+    pub fn save_world(&self) {
+        if !self.spawn_settled {
+            return;
+        }
+        let p = &self.player.ring_position;
+        let s = &self.player.spawn_position;
+        let save = crate::persistence::WorldSave {
+            player_position: (p.theta, p.y, p.height),
+            spawn_position: (s.theta, s.y, s.height),
+            health: self.player.health,
+            hotbar_index: self.player.hotbar_index as u8,
+            creative_mode: self.player.creative_mode,
+            shadow_phase: self.shadow_squares.phase,
+            inventory: self
+                .player
+                .inventory
+                .slots
+                .iter()
+                .map(|slot| slot.map(|st| (st.item_type as u8, st.count)))
+                .collect(),
+            edits: self
+                .chunk_manager
+                .edits
+                .iter()
+                .map(|(coord, map)| {
+                    let mut list: Vec<(u16, u8)> =
+                        map.iter().map(|(&i, &t)| (i, t as u8)).collect();
+                    list.sort_unstable();
+                    (
+                        (coord.ring_index, coord.width_index, coord.height_index),
+                        list,
+                    )
+                })
+                .collect(),
+        };
+        match save.write_to(crate::persistence::SAVE_PATH) {
+            Ok(()) => log::info!("World saved to {}", crate::persistence::SAVE_PATH),
+            Err(e) => log::warn!("Failed to save world: {}", e),
+        }
+    }
+
+    /// Apply a loaded save onto a freshly constructed State.
+    fn apply_save(&mut self, save: crate::persistence::WorldSave) {
+        let (t, y, h) = save.player_position;
+        self.player.ring_position = RingPosition::new(t, y, h);
+        let (t, y, h) = save.spawn_position;
+        self.player.spawn_position = RingPosition::new(t, y, h);
+        self.player.health = save.health.clamp(0.0, 20.0);
+        self.player.hotbar_index = (save.hotbar_index as usize).min(8);
+        self.player.creative_mode = save.creative_mode;
+        self.shadow_squares.phase = save
+            .shadow_phase
+            .rem_euclid(std::f64::consts::PI * 2.0);
+
+        let n_slots = self.player.inventory.slots.len();
+        for (i, slot) in save.inventory.iter().enumerate().take(n_slots) {
+            self.player.inventory.slots[i] = slot.and_then(|(raw, count)| {
+                let vt = crate::voxel::VoxelType::from(raw);
+                if count > 0 && vt != crate::voxel::VoxelType::Air {
+                    Some(crate::inventory::ItemStack::new(vt, count))
+                } else {
+                    None
+                }
+            });
+        }
+
+        self.chunk_manager.edits = save
+            .edits
+            .into_iter()
+            .map(|((r, w, h), list)| {
+                let map = list
+                    .into_iter()
+                    .map(|(idx, raw)| (idx, crate::voxel::VoxelType::from(raw)))
+                    .collect();
+                (ChunkCoord::new(r, w, h), map)
+            })
+            .collect();
+
+        // Defer placing the player until their chunk regenerates; physics is
+        // gated on spawn_settled, so they can't fall through meanwhile.
+        self.restored_position = Some(self.player.ring_position);
+        self.player.vertical_velocity = 0.0;
+        self.player.grounded = false;
     }
 
     fn create_depth_texture(
@@ -1028,6 +1137,13 @@ impl State {
         // has been generated and the player snapped onto the surface.
         if self.spawn_settled {
             self.player.update_physics(dt, &self.ring_config, &self.chunk_manager);
+
+            // Periodic autosave.
+            self.autosave_timer += dt.as_secs_f32();
+            if self.autosave_timer >= AUTOSAVE_INTERVAL_SECS {
+                self.autosave_timer = 0.0;
+                self.save_world();
+            }
         }
 
         // Update player
@@ -1376,8 +1492,12 @@ impl State {
         // fields are Send + Sync, so a shared &self reference is fine.
         let generator = &self.terrain_generator;
         let config = &self.ring_config;
+        let manager = &self.chunk_manager;
         to_generate.par_iter_mut().for_each(|chunk| {
             generator.generate_chunk(chunk, config);
+            // Re-apply persisted player edits before lighting so placed
+            // torches emit and removed blocks let sunlight through.
+            manager.apply_edits(chunk);
             LightingEngine::compute_lighting(chunk);
         });
 
@@ -1423,6 +1543,25 @@ impl State {
     /// Returns true when the player has been settled.
     fn try_settle_spawn(&mut self) -> bool {
         let config = &self.ring_config;
+
+        // Restored session: put the player back exactly where they saved,
+        // once the chunk they occupy has regenerated (edits re-applied).
+        if let Some(saved) = self.restored_position {
+            let coord = ChunkCoord::from_ring_position(&saved, config);
+            let ready = self
+                .chunk_manager
+                .get_chunk(&coord)
+                .map(|c| c.generated)
+                .unwrap_or(false);
+            if !ready {
+                return false;
+            }
+            self.player.ring_position = saved;
+            self.player.vertical_velocity = 0.0;
+            self.player.grounded = false;
+            self.restored_position = None;
+            return true;
+        }
 
         // Pick a spawn column near the origin that is on dry land (not Ocean
         // and above sea level), so the player doesn't deterministically spawn

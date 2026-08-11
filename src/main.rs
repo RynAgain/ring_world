@@ -22,6 +22,7 @@ mod crafting;
 mod lighting;
 mod audio;
 mod effects;
+mod persistence;
 
 use std::sync::Arc;
 use winit::{
@@ -64,7 +65,11 @@ fn main() {
                 window_id,
             } if window_id == window.id() => {
                 match event {
-                    WindowEvent::CloseRequested => elwt.exit(),
+                    WindowEvent::CloseRequested => {
+                        // Persist the session before quitting.
+                        state.save_world();
+                        elwt.exit();
+                    }
                     WindowEvent::Focused(focused) => {
                         if *focused && !input_state.cursor_locked {
                             // Re-lock cursor on focus gain
