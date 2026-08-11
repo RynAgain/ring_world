@@ -940,8 +940,19 @@ impl TerrainGenerator {
         let biome = self.sample_biome(noise_x, noise_z);
         let height = self.blended_terrain_height(noise_x, noise_z);
 
-        if height < SEA_LEVEL as f64 && (biome == Biome::Ocean || biome == Biome::Beach) {
-            return [0.15, 0.3, 0.7, 1.0];
+        // Water anywhere the land dips below sea level, regardless of biome
+        // label, shaded darker with depth so the arch shows real coastlines
+        // and shallow shelves instead of flat blue discs.
+        if height < SEA_LEVEL as f64 {
+            let depth = ((SEA_LEVEL as f64 - height) / 15.0).clamp(0.0, 1.0);
+            let shallow = [0.20, 0.45, 0.75];
+            let deep = [0.05, 0.15, 0.45];
+            return [
+                (shallow[0] + (deep[0] - shallow[0]) * depth) as f32,
+                (shallow[1] + (deep[1] - shallow[1]) * depth) as f32,
+                (shallow[2] + (deep[2] - shallow[2]) * depth) as f32,
+                1.0,
+            ];
         }
 
         if self.is_river(noise_x, noise_z, biome) {
@@ -949,6 +960,12 @@ impl TerrainGenerator {
         }
 
         biome.color_at_height(height, config.max_height)
+    }
+
+    /// Small-scale periodic color-variation scalar in [-1, 1] used by the
+    /// distant ring to mottle biome colors (breaks up flat banding).
+    pub fn sample_mottle(&self, noise_x: f64, noise_z: f64) -> f64 {
+        self.get2(&self.vegetation_noise, noise_x, noise_z, 0.8)
     }
 
     /// Convert local chunk voxel position to world ring coordinates (theta, y)

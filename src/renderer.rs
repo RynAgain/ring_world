@@ -785,8 +785,8 @@ impl State {
             &ring_config,
             &terrain_generator,
             30.0, // thickness
-            128,  // segments around
-            16,   // segments width (more for biome detail)
+            1024, // segments around (heightmapped relief needs density)
+            24,   // segments width
         );
 
         // Identity transform for the distant ring (it's already in world space)
