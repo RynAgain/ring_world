@@ -209,6 +209,11 @@ pub struct State {
 
     // Entity system
     pub entity_manager: EntityManager,
+    /// Per-frame entity render mesh (world-space boxes through the chunk
+    /// shader: they get sun diffuse, eclipse, and fog like terrain does).
+    entity_vertex_buffer: wgpu::Buffer,
+    entity_index_buffer: wgpu::Buffer,
+    entity_num_indices: u32,
 
     // Highlight box for placement preview / breaking target
     highlight_vertex_buffer: wgpu::Buffer,
@@ -815,6 +820,22 @@ impl State {
         // Sun disk + starfield.
         let sky = Sky::new(&device, config.format, &camera_bind_group_layout);
 
+        // Entity render buffers (placeholders; rebuilt per frame in update()).
+        let entity_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Entity Vertex Buffer (empty)"),
+            contents: bytemuck::cast_slice(&[ChunkVertex {
+                position: [0.0; 3], normal: [0.0; 3], color: [0.0; 4],
+                tex_coords: [0.0; 2], tex_index: 0, light_level: 0.0,
+                alpha_tested: 0,
+            }]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let entity_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Entity Index Buffer (empty)"),
+            contents: bytemuck::cast_slice(&[0u32]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
         // HUD
         let hud = Hud::new(&device, surface_format, size.width, size.height);
 
@@ -855,6 +876,9 @@ impl State {
             hud,
             player,
             entity_manager: EntityManager::new(),
+            entity_vertex_buffer,
+            entity_index_buffer,
+            entity_num_indices: 0,
             highlight_vertex_buffer,
             highlight_index_buffer,
             highlight_num_indices: 0,
@@ -1027,7 +1051,30 @@ impl State {
             &self.chunk_manager,
             &self.ring_config,
             &mut self.player.inventory,
+            self.shadow_squares
+                .daylight_at(self.player.ring_position.theta),
         );
+
+        // Rebuild the entity render mesh (world-space boxes, identity model).
+        let (entity_verts, entity_idx) =
+            crate::entity::build_entity_mesh(&self.entity_manager.entities, &self.ring_config);
+        if entity_idx.is_empty() {
+            self.entity_num_indices = 0;
+        } else {
+            self.entity_vertex_buffer =
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Entity Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&entity_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            self.entity_index_buffer =
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Entity Index Buffer"),
+                    contents: bytemuck::cast_slice(&entity_idx),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            self.entity_num_indices = entity_idx.len() as u32;
+        }
 
         // Smooth the FPS estimate for the debug overlay (exponential moving avg).
         let dt_secs_f = dt.as_secs_f32();
@@ -1918,6 +1965,19 @@ impl State {
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
                 rendered_chunks += 1;
+            }
+
+            // ---- Entities (end of Pass A: opaque, depth write on) ----
+            // World-space boxes with identity model transform; the opaque (or
+            // F6 debug) pipeline is still bound from the chunk loop above.
+            if self.entity_num_indices > 0 {
+                render_pass.set_bind_group(2, &self.distant_ring_transform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.entity_vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    self.entity_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..self.entity_num_indices, 0, 0..1);
             }
 
             // ---- Pass B: translucent water geometry ----

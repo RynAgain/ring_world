@@ -110,6 +110,18 @@ impl Entity {
         }
     }
 
+    pub fn mob_width(&self) -> f64 {
+        match self.mob_type {
+            MobType::Sheep => 0.9,
+            MobType::Cow => 1.0,
+            MobType::Pig => 0.8,
+            MobType::Chicken => 0.5,
+            MobType::Zombie => 0.6,
+            MobType::Skeleton => 0.6,
+            MobType::Spider => 1.2,
+        }
+    }
+
     pub fn mob_height(&self) -> f64 {
         match self.mob_type {
             MobType::Sheep => 1.3,
@@ -172,11 +184,12 @@ impl EntityManager {
         chunk_manager: &ChunkManager,
         config: &RingWorldConfig,
         inventory: &mut Inventory,
+        daylight: f32,
     ) {
         self.spawn_timer += dt;
         if self.spawn_timer >= 5.0 {
             self.spawn_timer = 0.0;
-            self.try_spawn(player_position, chunk_manager, config);
+            self.try_spawn(player_position, chunk_manager, config, daylight);
         }
 
         let player_pos = *player_position;
@@ -228,6 +241,7 @@ impl EntityManager {
         player_position: &RingPosition,
         chunk_manager: &ChunkManager,
         config: &RingWorldConfig,
+        daylight: f32,
     ) {
         if self.entities.len() >= self.max_entities {
             return;
@@ -265,7 +279,10 @@ impl EntityManager {
                 // Check light level at spawn position to determine mob type
                 let light_level = lighting::get_light_level_at(&spawn_pos, chunk_manager, config);
 
-                let mob_type = if light_level < 7 {
+                // Hostiles spawn in the dark: unlit caves OR the shadow-square
+                // night outside (the day/night cycle now has teeth). Passive
+                // mobs need a lit, daytime surface.
+                let mob_type = if light_level < 7 || daylight < 0.3 {
                     // Dark areas: hostile mobs spawn (caves, underground, unlit areas)
                     match rng.gen_range(0..3u32) {
                         0 => MobType::Zombie,
@@ -616,6 +633,83 @@ fn apply_gravity(
     }
 }
 
+/// Build a renderable world-space mesh for every living entity: one shaded
+/// box per mob, sized by mob_width/mob_height, tinted by render_color, and
+/// oriented in the ring's local frame at the entity's theta (true tangent /
+/// radial-up / axial). Vertices are in WORLD space: draw with the identity
+/// transform bind group. The boxes go through the normal chunk shader, so
+/// they receive sun diffuse, the shadow-square eclipse, and fog for free.
+pub fn build_entity_mesh(
+    entities: &[Entity],
+    config: &RingWorldConfig,
+) -> (Vec<crate::chunk::ChunkVertex>, Vec<u32>) {
+    use crate::texture::TEX_SNOW;
+
+    let mut vertices: Vec<crate::chunk::ChunkVertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for entity in entities.iter().filter(|e| e.alive) {
+        let center = entity.position.to_cartesian(config);
+        let theta = entity.position.theta;
+        let (sin_t, cos_t) = (theta.sin() as f32, theta.cos() as f32);
+
+        // Ring-local orthonormal frame at the entity's angle (matches the
+        // curved chunk meshing convention: TRUE tangent).
+        let tangent = [-sin_t, 0.0, cos_t];
+        let up = [-cos_t, 0.0, -sin_t]; // radial-in, toward the sun
+        let axial = [0.0f32, 1.0, 0.0];
+
+        let hw = (entity.mob_width() * 0.5) as f32;
+        let hh = (entity.mob_height() * 0.5) as f32;
+        let c = [center.x as f32, center.y as f32, center.z as f32];
+        let color = entity.render_color();
+
+        let scale3 = |v: [f32; 3], s: f32| [v[0] * s, v[1] * s, v[2] * s];
+        let add3 = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+        let neg3 = |v: [f32; 3]| [-v[0], -v[1], -v[2]];
+
+        // Each face: (outward normal, u basis, v basis, half-extents) chosen
+        // so u x v points along the normal (CCW-outward winding for the
+        // back-face-culling opaque pipeline).
+        let faces: [([f32; 3], [f32; 3], [f32; 3], f32, f32, f32); 6] = [
+            (tangent, axial, up, hw, hw, hh),           // +tangent: axial x up = tangent
+            (neg3(tangent), up, axial, hw, hh, hw),     // -tangent: up x axial = -tangent
+            (up, tangent, axial, hh, hw, hw),           // +up (head): tangent x axial = ... see test
+            (neg3(up), axial, tangent, hh, hw, hw),     // -up (feet)
+            (axial, up, tangent, hw, hh, hw),           // +axial
+            (neg3(axial), tangent, up, hw, hw, hh),     // -axial
+        ];
+
+        for (normal, u, v, n_half, u_half, v_half) in faces.iter() {
+            let fc = add3(c, scale3(*normal, *n_half));
+            let uu = scale3(*u, *u_half);
+            let vv = scale3(*v, *v_half);
+            let corners = [
+                add3(add3(fc, neg3(uu)), neg3(vv)),
+                add3(add3(fc, uu), neg3(vv)),
+                add3(add3(fc, uu), vv),
+                add3(add3(fc, neg3(uu)), vv),
+            ];
+            let uvs = [[0.0f32, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+            let base = vertices.len() as u32;
+            for (i, corner) in corners.iter().enumerate() {
+                vertices.push(crate::chunk::ChunkVertex {
+                    position: *corner,
+                    normal: *normal,
+                    color,
+                    tex_coords: uvs[i],
+                    tex_index: TEX_SNOW,
+                    light_level: 1.0,
+                    alpha_tested: 0,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+
+    (vertices, indices)
+}
+
 /// Calculate approximate distance between two ring positions in blocks
 pub fn ring_distance(a: &RingPosition, b: &RingPosition, config: &RingWorldConfig) -> f32 {
     let d_theta = (a.theta - b.theta) * config.radius;
@@ -706,6 +800,61 @@ fn is_position_water_entity(pos: &RingPosition, config: &RingWorldConfig, chunk_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn entity_mesh_boxes_wind_ccw_outward() {
+        // Regression guard: entity boxes draw through the back-face-culling
+        // opaque pipeline, so every triangle must wind CCW seen from outside
+        // (geometric normal agrees with the declared outward normal) at
+        // several ring angles.
+        let config = crate::ring_world::RingWorldConfig::default();
+        for theta in [0.0f64, 0.7, 1.6, 3.14, 4.5, 6.0] {
+            let e = super::Entity::new(
+                1,
+                super::MobType::Cow,
+                crate::ring_world::RingPosition::new(theta, 3.0, 10.0),
+            );
+            let (verts, idx) = super::build_entity_mesh(&[e], &config);
+            assert_eq!(verts.len(), 24);
+            assert_eq!(idx.len(), 36);
+            for tri in idx.chunks(3) {
+                let a = &verts[tri[0] as usize];
+                let b = &verts[tri[1] as usize];
+                let c = &verts[tri[2] as usize];
+                let e1 = [
+                    b.position[0] - a.position[0],
+                    b.position[1] - a.position[1],
+                    b.position[2] - a.position[2],
+                ];
+                let e2 = [
+                    c.position[0] - a.position[0],
+                    c.position[1] - a.position[1],
+                    c.position[2] - a.position[2],
+                ];
+                let geo = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let dot = geo[0] * a.normal[0] + geo[1] * a.normal[1] + geo[2] * a.normal[2];
+                assert!(dot > 0.0, "entity face winds against normal at theta {}", theta);
+            }
+        }
+    }
+
+    #[test]
+    fn dead_entities_are_not_meshed() {
+        let config = crate::ring_world::RingWorldConfig::default();
+        let mut e = super::Entity::new(
+            1,
+            super::MobType::Pig,
+            crate::ring_world::RingPosition::new(1.0, 0.0, 10.0),
+        );
+        e.alive = false;
+        let (verts, idx) = super::build_entity_mesh(&[e], &config);
+        assert!(verts.is_empty() && idx.is_empty());
+    }
+
+
     use super::*;
 
     fn test_pos() -> RingPosition {
