@@ -2,6 +2,7 @@
 name = "ring_world"
 version = "0.1.0"
 edition = "2021"
+default-run = "ring_world"
 description = "A voxel game set on a ring world (like a Halo/Niven Ring) with a sun in the center"
 
 [dependencies]
