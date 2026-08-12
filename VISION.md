@@ -39,6 +39,46 @@ at night, persist between sessions. The ring identity is real: curved chunks,
 eternal-noon sun with orbiting shadow squares, per-fragment terminator, stars
 at night, seamless world seam, arch overhead.
 
+## Beyond "Minecraft in space" (2026-08-11)
+
+Fair criticism from playtesting: mine/craft/build/survive on a curved map is
+still just Minecraft with a bent horizon. The ring needs to change WHAT YOU
+DO, not just what the skybox looks like. Three candidate identities, ordered
+by conviction:
+
+### 1. The Dying Ring (recommended core loop)
+The ring is a machine, and it is failing. Whole segments of the arch overhead
+are visibly dark/dead: no plants, no water, gray dust biomes. The player
+discovers they can restore segments by finding and repairing spine machinery
+(power conduits, weather masts, buried terraform nodes; dungeon-like fixed
+structures with puzzle/combat interiors). When a segment is repaired, IT
+VISIBLY HEALS ON THE ARCH OVERHEAD: the sky-map turns from gray to green.
+- Why it works: the arch stops being wallpaper and becomes the progress bar,
+  the quest map, and the reward screen all at once. Nobody else can do this;
+  it is only possible on a ring.
+- Survival mechanics stay, but recontextualized: you mine and craft IN ORDER
+  TO repair, not as the point.
+- Natural endgame: relight the whole ring.
+
+### 2. Spin physics as a toy (moment-to-moment differentiator)
+Gravity on a ring is centrifugal: it weakens with altitude (at 64 blocks up
+it is ~10% weaker; we can exaggerate) and Coriolis bends every throw and
+fall spinward/antispinward. Tall towers become low-gravity playgrounds,
+long falls drift sideways, thrown projectiles curve differently east vs
+west, and gliders become the ring's signature transport.
+- Cheap to implement (a scale factor + a lateral term in the physics),
+  immediately felt, and physically HONEST, which fits pillar 4.
+
+### 3. The Shadow Squares are places
+The things that make night are flying islands on cables. Late game: climb a
+rim-wall elevator or fly a glider to a shadow square and build there,
+looking DOWN at the ring. Night becomes something you can stand on.
+
+Direction: adopt #1 as the game's spine, #2 as ambient physics polish, #3 as
+a late-game aspiration. Next concrete steps for #1: dead-segment biome
+(gray/dust, no vegetation, drained water), a repairable "terraform node"
+structure, arch coloring driven by segment repair state.
+
 ## Roadmap
 
 ### Near (polish the feel)

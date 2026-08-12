@@ -576,3 +576,33 @@ Tests: 217 total (186 ring_world + 31 block_gallery), all passing.
 
 Tests: 222 total (191 ring_world + 31 block_gallery), all passing.
 
+## 2026-08-11 Batch 4: Playtest Bug Fixes (Ryan's report)
+
+- **Everything-is-Plains fixed** (`terrain.rs`): the seamless-noise circle
+  (radius ~6.5) collapsed at flat-world frequencies; biome scalar was
+  near-constant so one biome covered the ring, rivers never occurred, and
+  the continental swell was a fixed offset. Frequencies retuned for the
+  wrapped domain (biome 0.28/0.9, continent 0.09, river 0.1 + threshold
+  0.04, hills 0.2) giving ~10 macro biome regions per ring. Regression test
+  samples 512 thetas and requires >= 4 distinct biomes + scalar spread.
+- **Chunk-load hitch fixed** (`renderer.rs`): generation and meshing now run
+  under per-frame budgets (24 gens, 10 mesh rebuilds), distance-sorted so
+  the nearest terrain streams first and player block edits (distance 0)
+  still re-mesh the same frame.
+- **Mob vertical oscillation fixed** (`entity.rs`): landing snap computed
+  `floor(feet)+1`; feet resting exactly on an integer boundary teleported
+  the mob up a block every other frame. Snap now derives from the block the
+  ground probe hit: `floor(feet - 0.05)+1`. Test asserts bit-stable height
+  over 400 frames.
+- **Red damage flash**: `Entity.hurt_timer` (0.35 s) set on damage, decays
+  in update; `build_entity_mesh` blends body color toward red while it
+  runs. Test asserts the mesh actually reddens after a hit.
+- **Distant ring axial misalignment fixed** (`distant_ring.rs`):
+  `half_width` was set to the FULL width, shifting the arch by width/2 along
+  the axis relative to real terrain. Test now asserts exact y extent.
+- **VISION.md**: new "Beyond Minecraft in space" section — Dying Ring core
+  loop (repair segments, watch the arch heal), spin physics, shadow squares
+  as places.
+
+Tests: 225 total (194 ring_world + 31 block_gallery), all passing.
+
