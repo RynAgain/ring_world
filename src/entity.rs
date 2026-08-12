@@ -8,16 +8,34 @@ use crate::lighting;
 use crate::ring_world::{ChunkCoord, RingPosition, RingWorldConfig};
 use crate::voxel::VoxelType;
 
-/// Types of mobs that can exist in the world
+/// Types of mobs that can exist on the ring. Three families:
+/// - Native FAUNA (passive): Grazer, Skitterling, Floater
+/// - Ring NATIVES (passive humanoids): Ringkin, who build the villages
+/// - Threats (hostile): Sentinel machines guarding ring facilities, and
+///   Stalkers, nocturnal native predators
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MobType {
-    Sheep,
-    Cow,
-    Pig,
-    Chicken,
-    Zombie,
-    Skeleton,
-    Spider,
+    /// Six-legged tan herbivore; placid, common on grass in daylight.
+    Grazer,
+    /// Small skittish scuttler; fast, harmless.
+    Skitterling,
+    /// Bioluminescent gasbag that hovers ~2 blocks up, trailing tendrils.
+    Floater,
+    /// The ring's natives: robed teal-skinned humanoids living in villages.
+    Ringkin,
+    /// Ancient security mech: tall gunmetal frame, glowing red eye-bar.
+    /// Guards facilities (ruins, the sun tower) day AND night; rare night
+    /// patrols elsewhere.
+    Sentinel,
+    /// Low six-legged nocturnal predator.
+    Stalker,
+}
+
+impl MobType {
+    /// Hovering mobs skip normal gravity and float above the ground.
+    pub fn hovers(&self) -> bool {
+        matches!(self, MobType::Floater)
+    }
 }
 
 /// Behavior category for a mob
@@ -99,62 +117,57 @@ impl Entity {
 
     pub fn drop_item(&self) -> VoxelType {
         match self.mob_type {
-            MobType::Sheep => VoxelType::Dirt,
-            MobType::Cow => VoxelType::Dirt,
-            MobType::Pig => VoxelType::Dirt,
-            MobType::Chicken => VoxelType::Dirt,
-            MobType::Zombie => VoxelType::IronOre,
-            MobType::Skeleton => VoxelType::GoldOre,
-            MobType::Spider => VoxelType::Vine,
+            MobType::Grazer => VoxelType::Leaves,
+            MobType::Skitterling => VoxelType::Flower,
+            MobType::Floater => VoxelType::Torch, // bioluminescent core
+            MobType::Ringkin => VoxelType::Plank,
+            MobType::Sentinel => VoxelType::IronIngot, // salvage
+            MobType::Stalker => VoxelType::Vine, // sinew
         }
     }
 
     pub fn render_color(&self) -> [f32; 4] {
         match self.mob_type {
-            MobType::Sheep => [0.9, 0.9, 0.9, 1.0],
-            MobType::Cow => [0.4, 0.2, 0.1, 1.0],
-            MobType::Pig => [0.9, 0.6, 0.6, 1.0],
-            MobType::Chicken => [1.0, 1.0, 0.8, 1.0],
-            MobType::Zombie => [0.3, 0.5, 0.3, 1.0],
-            MobType::Skeleton => [0.8, 0.8, 0.75, 1.0],
-            MobType::Spider => [0.2, 0.2, 0.2, 1.0],
+            MobType::Grazer => [0.62, 0.55, 0.40, 1.0],      // dusty tan
+            MobType::Skitterling => [0.55, 0.72, 0.55, 1.0], // pale green
+            MobType::Floater => [0.55, 0.82, 0.92, 1.0],     // glowing cyan
+            MobType::Ringkin => [0.45, 0.62, 0.58, 1.0],     // teal skin
+            MobType::Sentinel => [0.60, 0.63, 0.68, 1.0],    // gunmetal
+            MobType::Stalker => [0.28, 0.22, 0.34, 1.0],     // dark violet
         }
     }
 
     pub fn mob_width(&self) -> f64 {
         match self.mob_type {
-            MobType::Sheep => 0.9,
-            MobType::Cow => 1.0,
-            MobType::Pig => 0.8,
-            MobType::Chicken => 0.5,
-            MobType::Zombie => 0.6,
-            MobType::Skeleton => 0.6,
-            MobType::Spider => 1.2,
+            MobType::Grazer => 1.1,
+            MobType::Skitterling => 0.4,
+            MobType::Floater => 0.8,
+            MobType::Ringkin => 0.6,
+            MobType::Sentinel => 0.9,
+            MobType::Stalker => 1.1,
         }
     }
 
     pub fn mob_height(&self) -> f64 {
         match self.mob_type {
-            MobType::Sheep => 1.3,
-            MobType::Cow => 1.5,
-            MobType::Pig => 1.0,
-            MobType::Chicken => 0.7,
-            MobType::Zombie => 2.0,
-            MobType::Skeleton => 2.0,
-            MobType::Spider => 0.8,
+            MobType::Grazer => 1.2,
+            MobType::Skitterling => 0.5,
+            MobType::Floater => 0.9,
+            MobType::Ringkin => 2.1,
+            MobType::Sentinel => 2.6,
+            MobType::Stalker => 0.9,
         }
     }
 }
 
 fn mob_properties(mob_type: MobType) -> (f32, f32, f64, f32, MobBehavior) {
     match mob_type {
-        MobType::Sheep => (8.0, 0.0, 1.5, 0.0, MobBehavior::Passive),
-        MobType::Cow => (10.0, 0.0, 1.5, 0.0, MobBehavior::Passive),
-        MobType::Pig => (10.0, 0.0, 1.5, 0.0, MobBehavior::Passive),
-        MobType::Chicken => (4.0, 0.0, 2.0, 0.0, MobBehavior::Passive),
-        MobType::Zombie => (20.0, 3.0, 2.0, 16.0, MobBehavior::Hostile),
-        MobType::Skeleton => (20.0, 4.0, 2.0, 24.0, MobBehavior::Hostile),
-        MobType::Spider => (16.0, 2.0, 3.0, 12.0, MobBehavior::Hostile),
+        MobType::Grazer => (12.0, 0.0, 1.2, 0.0, MobBehavior::Passive),
+        MobType::Skitterling => (4.0, 0.0, 2.5, 0.0, MobBehavior::Passive),
+        MobType::Floater => (6.0, 0.0, 0.8, 0.0, MobBehavior::Passive),
+        MobType::Ringkin => (16.0, 0.0, 1.6, 0.0, MobBehavior::Passive),
+        MobType::Sentinel => (30.0, 5.0, 1.6, 20.0, MobBehavior::Hostile),
+        MobType::Stalker => (16.0, 3.0, 3.0, 14.0, MobBehavior::Hostile),
     }
 }
 
@@ -196,11 +209,12 @@ impl EntityManager {
         config: &RingWorldConfig,
         inventory: &mut Inventory,
         daylight: f32,
+        terrain: &crate::terrain::TerrainGenerator,
     ) {
         self.spawn_timer += dt;
         if self.spawn_timer >= 5.0 {
             self.spawn_timer = 0.0;
-            self.try_spawn(player_position, chunk_manager, config, daylight);
+            self.try_spawn(player_position, chunk_manager, config, daylight, terrain);
         }
 
         let player_pos = *player_position;
@@ -257,6 +271,7 @@ impl EntityManager {
         chunk_manager: &ChunkManager,
         config: &RingWorldConfig,
         daylight: f32,
+        terrain: &crate::terrain::TerrainGenerator,
     ) {
         if self.entities.len() >= self.max_entities {
             return;
@@ -294,23 +309,43 @@ impl EntityManager {
                 // Check light level at spawn position to determine mob type
                 let light_level = lighting::get_light_level_at(&spawn_pos, chunk_manager, config);
 
-                // Hostiles spawn in the dark: unlit caves OR the shadow-square
-                // night outside (the day/night cycle now has teeth). Passive
-                // mobs need a lit, daytime surface.
-                let mob_type = if light_level < 7 || daylight < 0.3 {
-                    // Dark areas: hostile mobs spawn (caves, underground, unlit areas)
-                    match rng.gen_range(0..3u32) {
-                        0 => MobType::Zombie,
-                        1 => MobType::Skeleton,
-                        _ => MobType::Spider,
+                // Spawn ecology (deterministic structure queries):
+                // - Sentinels guard FACILITIES (ruins, sun tower) day and
+                //   night, and run rare night patrols elsewhere.
+                // - Ringkin natives live around the villages they build,
+                //   in daylight.
+                // - Stalkers hunt in the dark (unlit caves or shadow-square
+                //   night); native fauna needs a lit daytime surface.
+                let cs = config.chunk_size as f64;
+                let world_x = (spawn_theta.rem_euclid(std::f64::consts::TAU)
+                    / config.chunk_angular_size()
+                    * cs) as i32;
+                let world_z = ((spawn_y + config.width / 2.0)
+                    / config.chunk_width_size()
+                    * cs) as i32;
+                let near_facility = terrain
+                    .facility_center_near(world_x, world_z, config, 28)
+                    .is_some();
+                let near_village = terrain
+                    .village_center_near(world_x, world_z, config, 48)
+                    .is_some();
+                let dark = light_level < 7 || daylight < 0.3;
+
+                let mob_type = if near_facility {
+                    MobType::Sentinel
+                } else if dark {
+                    if rng.gen_range(0..4u32) == 0 {
+                        MobType::Sentinel // night patrol far from its post
+                    } else {
+                        MobType::Stalker
                     }
+                } else if near_village && rng.gen_range(0..5u32) < 3 {
+                    MobType::Ringkin
                 } else {
-                    // Well-lit areas: passive mobs only
-                    match rng.gen_range(0..4u32) {
-                        0 => MobType::Sheep,
-                        1 => MobType::Cow,
-                        2 => MobType::Pig,
-                        _ => MobType::Chicken,
+                    match rng.gen_range(0..3u32) {
+                        0 => MobType::Grazer,
+                        1 => MobType::Skitterling,
+                        _ => MobType::Floater,
                     }
                 };
 
@@ -559,6 +594,8 @@ fn update_hostile_ai(
 
 /// Duration of the red damage flash on a hit mob, in seconds.
 const HURT_FLASH_SECS: f32 = 0.35;
+/// How far above the ground a Floater's feet hover, in blocks.
+const FLOATER_HOVER_HEIGHT: f64 = 2.0;
 
 /// Speed of the hop a mob uses to climb a 1-block step
 /// (apex = v^2 / (2 g) = 6.8^2 / 40 = ~1.16 blocks).
@@ -655,6 +692,27 @@ fn apply_gravity(
     let dt_f64 = dt as f64;
     let gravity = 20.0;
 
+    // Hovering mobs (Floaters) ignore gravity: ease toward a point ~2
+    // blocks above the ground with a gentle per-individual bob. They count
+    // as grounded so the movement code treats them as supported.
+    if entity.mob_type.hovers() {
+        if let Some(ground) = find_ground_height(
+            entity.position.theta,
+            entity.position.y,
+            config,
+            chunk_manager,
+        ) {
+            let bob = ((entity.walk_phase * 0.5) + entity.id as f64 * 1.7).sin() * 0.25;
+            let target = ground + FLOATER_HOVER_HEIGHT + bob + entity.mob_height() * 0.5;
+            let dh = target - entity.position.height;
+            entity.position.height += dh * (dt_f64 * 2.0).min(1.0);
+            entity.vertical_velocity = 0.0;
+            entity.is_grounded = true;
+            entity.position.height = entity.position.height.clamp(1.0, config.max_height - 1.0);
+            return;
+        }
+    }
+
     if !entity.is_grounded {
         entity.vertical_velocity -= gravity * dt_f64;
         if entity.vertical_velocity < -50.0 {
@@ -709,63 +767,70 @@ fn part(offset: [f64; 3], half: [f64; 3], color_mul: [f32; 3], swing: f64) -> Mo
     MobPart { offset, half, color_mul, swing }
 }
 
-/// Composite box model per mob type (Minecraft-style: body + head + limbs).
+/// Composite box model per mob type (body + head + limbs in the mob's
+/// local fwd/side/up frame, offsets from the feet origin).
 fn mob_parts(mob: MobType) -> Vec<MobPart> {
-    let leg = [0.55, 0.55, 0.55];
+    let limb = [0.55, 0.55, 0.55];
     let head = [0.85, 0.85, 0.85];
     let body = [1.0, 1.0, 1.0];
     match mob {
-        MobType::Sheep => vec![
-            part([0.0, 0.0, 0.80], [0.45, 0.32, 0.30], body, 0.0),
-            part([0.50, 0.0, 1.05], [0.16, 0.14, 0.16], [0.75, 0.70, 0.70], 0.0),
-            part([0.28, 0.22, 0.25], [0.09, 0.09, 0.25], leg, 1.0),
-            part([0.28, -0.22, 0.25], [0.09, 0.09, 0.25], leg, -1.0),
-            part([-0.28, 0.22, 0.25], [0.09, 0.09, 0.25], leg, -1.0),
-            part([-0.28, -0.22, 0.25], [0.09, 0.09, 0.25], leg, 1.0),
+        // Six-legged herbivore: long low body, drooped grazing head.
+        MobType::Grazer => vec![
+            part([0.0, 0.0, 0.66], [0.55, 0.30, 0.26], body, 0.0),
+            part([0.64, 0.0, 0.48], [0.14, 0.12, 0.14], head, 0.0),
+            part([0.38, 0.26, 0.20], [0.07, 0.07, 0.20], limb, 1.0),
+            part([0.38, -0.26, 0.20], [0.07, 0.07, 0.20], limb, -1.0),
+            part([0.0, 0.26, 0.20], [0.07, 0.07, 0.20], limb, -1.0),
+            part([0.0, -0.26, 0.20], [0.07, 0.07, 0.20], limb, 1.0),
+            part([-0.38, 0.26, 0.20], [0.07, 0.07, 0.20], limb, 1.0),
+            part([-0.38, -0.26, 0.20], [0.07, 0.07, 0.20], limb, -1.0),
         ],
-        MobType::Cow => vec![
-            part([0.0, 0.0, 0.95], [0.50, 0.35, 0.33], body, 0.0),
-            part([0.58, 0.0, 1.28], [0.18, 0.16, 0.18], head, 0.0),
-            part([0.32, 0.24, 0.31], [0.10, 0.10, 0.31], leg, 1.0),
-            part([0.32, -0.24, 0.31], [0.10, 0.10, 0.31], leg, -1.0),
-            part([-0.32, 0.24, 0.31], [0.10, 0.10, 0.31], leg, -1.0),
-            part([-0.32, -0.24, 0.31], [0.10, 0.10, 0.31], leg, 1.0),
+        // Tiny scuttler: low body, oversized sensor head, 4 pin legs.
+        MobType::Skitterling => vec![
+            part([0.0, 0.0, 0.24], [0.14, 0.10, 0.09], body, 0.0),
+            part([0.16, 0.0, 0.36], [0.08, 0.07, 0.08], head, 0.0),
+            part([0.08, 0.09, 0.08], [0.02, 0.02, 0.08], limb, 1.0),
+            part([0.08, -0.09, 0.08], [0.02, 0.02, 0.08], limb, -1.0),
+            part([-0.08, 0.09, 0.08], [0.02, 0.02, 0.08], limb, -1.0),
+            part([-0.08, -0.09, 0.08], [0.02, 0.02, 0.08], limb, 1.0),
         ],
-        MobType::Pig => vec![
-            part([0.0, 0.0, 0.63], [0.42, 0.30, 0.28], body, 0.0),
-            part([0.50, 0.0, 0.72], [0.15, 0.15, 0.15], head, 0.0),
-            part([0.67, 0.0, 0.68], [0.04, 0.08, 0.06], [0.95, 0.55, 0.55], 0.0),
-            part([0.26, 0.18, 0.17], [0.09, 0.09, 0.17], leg, 1.0),
-            part([0.26, -0.18, 0.17], [0.09, 0.09, 0.17], leg, -1.0),
-            part([-0.26, 0.18, 0.17], [0.09, 0.09, 0.17], leg, -1.0),
-            part([-0.26, -0.18, 0.17], [0.09, 0.09, 0.17], leg, 1.0),
+        // Hovering gasbag: glowing bell + three trailing tendrils. The
+        // hover physics keeps its feet ~2 blocks off the ground.
+        MobType::Floater => vec![
+            part([0.0, 0.0, 0.62], [0.28, 0.28, 0.24], body, 0.0),
+            part([0.0, 0.0, 0.86], [0.14, 0.14, 0.06], [1.2, 1.2, 1.2], 0.0),
+            part([0.0, 0.18, 0.18], [0.03, 0.03, 0.20], [0.7, 0.9, 1.0], 1.0),
+            part([0.0, -0.18, 0.18], [0.03, 0.03, 0.20], [0.7, 0.9, 1.0], -1.0),
+            part([0.12, 0.0, 0.18], [0.03, 0.03, 0.20], [0.7, 0.9, 1.0], 1.0),
         ],
-        MobType::Chicken => vec![
-            part([0.0, 0.0, 0.41], [0.18, 0.14, 0.16], body, 0.0),
-            part([0.15, 0.0, 0.66], [0.09, 0.08, 0.11], body, 0.0),
-            part([0.28, 0.0, 0.64], [0.05, 0.03, 0.03], [1.0, 0.6, 0.2], 0.0),
-            part([0.02, 0.08, 0.12], [0.03, 0.03, 0.12], [0.9, 0.65, 0.3], 1.0),
-            part([0.02, -0.08, 0.12], [0.03, 0.03, 0.12], [0.9, 0.65, 0.3], -1.0),
+        // Robed native: ochre robe (rigid), teal skin, swinging arms.
+        MobType::Ringkin => vec![
+            part([0.0, 0.0, 0.50], [0.17, 0.22, 0.50], [0.85, 0.62, 0.30], 0.0),
+            part([0.0, 0.0, 1.32], [0.14, 0.22, 0.32], [0.75, 0.55, 0.28], 0.0),
+            part([0.0, 0.0, 1.86], [0.14, 0.14, 0.18], body, 0.0),
+            part([0.0, 0.32, 1.34], [0.06, 0.06, 0.30], body, -1.0),
+            part([0.0, -0.32, 1.34], [0.06, 0.06, 0.30], body, 1.0),
         ],
-        MobType::Zombie | MobType::Skeleton => vec![
-            part([0.0, 0.0, 1.20], [0.15, 0.25, 0.40], body, 0.0),
-            part([0.0, 0.0, 1.80], [0.16, 0.16, 0.20], head, 0.0),
-            part([0.0, 0.34, 1.28], [0.08, 0.08, 0.34], leg, -1.0),
-            part([0.0, -0.34, 1.28], [0.08, 0.08, 0.34], leg, 1.0),
-            part([0.0, 0.13, 0.40], [0.09, 0.09, 0.40], leg, 1.0),
-            part([0.0, -0.13, 0.40], [0.09, 0.09, 0.40], leg, -1.0),
+        // Security mech: thick strider legs, armored chest, red eye-bar.
+        MobType::Sentinel => vec![
+            part([0.0, 0.18, 0.55], [0.10, 0.10, 0.55], [0.45, 0.45, 0.50], 1.0),
+            part([0.0, -0.18, 0.55], [0.10, 0.10, 0.55], [0.45, 0.45, 0.50], -1.0),
+            part([0.0, 0.0, 1.22], [0.16, 0.24, 0.12], [0.50, 0.52, 0.56], 0.0),
+            part([0.0, 0.0, 1.72], [0.22, 0.34, 0.36], body, 0.0),
+            part([0.0, 0.42, 2.00], [0.08, 0.10, 0.10], [0.50, 0.52, 0.56], 0.0),
+            part([0.0, -0.42, 2.00], [0.08, 0.10, 0.10], [0.50, 0.52, 0.56], 0.0),
+            part([0.0, 0.0, 2.32], [0.10, 0.26, 0.10], [1.5, 0.15, 0.15], 0.0),
         ],
-        MobType::Spider => vec![
-            part([-0.10, 0.0, 0.42], [0.32, 0.28, 0.20], body, 0.0),
-            part([0.32, 0.0, 0.40], [0.16, 0.16, 0.14], [0.35, 0.15, 0.15], 0.0),
-            part([0.24, 0.40, 0.30], [0.05, 0.22, 0.04], leg, 1.0),
-            part([0.24, -0.40, 0.30], [0.05, 0.22, 0.04], leg, -1.0),
-            part([0.08, 0.42, 0.30], [0.05, 0.24, 0.04], leg, -1.0),
-            part([0.08, -0.42, 0.30], [0.05, 0.24, 0.04], leg, 1.0),
-            part([-0.08, 0.42, 0.30], [0.05, 0.24, 0.04], leg, 1.0),
-            part([-0.08, -0.42, 0.30], [0.05, 0.24, 0.04], leg, -1.0),
-            part([-0.24, 0.40, 0.30], [0.05, 0.22, 0.04], leg, -1.0),
-            part([-0.24, -0.40, 0.30], [0.05, 0.22, 0.04], leg, 1.0),
+        // Nocturnal predator: long low body, jawed head, six splayed legs.
+        MobType::Stalker => vec![
+            part([-0.05, 0.0, 0.50], [0.45, 0.24, 0.18], body, 0.0),
+            part([0.52, 0.0, 0.44], [0.16, 0.13, 0.12], [0.7, 0.6, 0.75], 0.0),
+            part([0.30, 0.38, 0.30], [0.05, 0.20, 0.04], limb, 1.0),
+            part([0.30, -0.38, 0.30], [0.05, 0.20, 0.04], limb, -1.0),
+            part([0.0, 0.40, 0.30], [0.05, 0.22, 0.04], limb, -1.0),
+            part([0.0, -0.40, 0.30], [0.05, 0.22, 0.04], limb, 1.0),
+            part([-0.30, 0.38, 0.30], [0.05, 0.20, 0.04], limb, 1.0),
+            part([-0.30, -0.38, 0.30], [0.05, 0.20, 0.04], limb, -1.0),
         ],
     }
 }
@@ -1075,15 +1140,15 @@ mod tests {
         for theta in [0.0f64, 0.7, 1.6, 3.14, 4.5, 6.0] {
             let mut e = super::Entity::new(
                 1,
-                super::MobType::Cow,
+                super::MobType::Grazer,
                 crate::ring_world::RingPosition::new(theta, 3.0, 10.0),
             );
             e.facing = 0.9;
             e.walk_phase = 2.3;
+            let n_parts = super::mob_parts(super::MobType::Grazer).len();
             let (verts, idx) = super::build_entity_mesh(&[e], &config);
-            // Cow model: 6 parts (body, head, 4 legs), 24 verts / 36 idx each.
-            assert_eq!(verts.len(), 24 * 6);
-            assert_eq!(idx.len(), 36 * 6);
+            assert_eq!(verts.len(), 24 * n_parts);
+            assert_eq!(idx.len(), 36 * n_parts);
             for tri in idx.chunks(3) {
                 let a = &verts[tri[0] as usize];
                 let b = &verts[tri[1] as usize];
@@ -1178,7 +1243,7 @@ mod tests {
         let y0 = -config.width / 2.0 + 8.5;
         let mut e = super::Entity::new(
             1,
-            super::MobType::Pig,
+            super::MobType::Stalker,
             crate::ring_world::RingPosition::new(4.5 * block_theta, y0, 11.5),
         );
 
@@ -1211,7 +1276,7 @@ mod tests {
         let config = crate::ring_world::RingWorldConfig::default();
         let mut mgr = super::EntityManager::new();
         let pos = crate::ring_world::RingPosition::new(1.0, 0.0, 30.0);
-        let id = mgr.spawn_entity(super::MobType::Cow, pos);
+        let id = mgr.spawn_entity(super::MobType::Grazer, pos);
 
         let (verts_before, _) = super::build_entity_mesh(&mgr.entities, &config);
         let knockback = crate::ring_world::RingPosition::new(0.9, 0.0, 30.0);
@@ -1251,7 +1316,7 @@ mod tests {
         let y0 = -config.width / 2.0 + 8.5;
         let mut e = super::Entity::new(
             1,
-            super::MobType::Sheep,
+            super::MobType::Grazer,
             crate::ring_world::RingPosition::new(8.0 * block_theta, y0, 13.0),
         );
 
@@ -1283,7 +1348,7 @@ mod tests {
         let config = crate::ring_world::RingWorldConfig::default();
         let mut e = super::Entity::new(
             1,
-            super::MobType::Pig,
+            super::MobType::Skitterling,
             crate::ring_world::RingPosition::new(1.0, 0.0, 10.0),
         );
         e.alive = false;
@@ -1307,13 +1372,13 @@ mod tests {
     #[test]
     fn spawn_entity_adds_with_correct_properties() {
         let mut mgr = EntityManager::new();
-        let id = mgr.spawn_entity(MobType::Zombie, test_pos());
+        let id = mgr.spawn_entity(MobType::Sentinel, test_pos());
         assert_ne!(id, 0);
         assert_eq!(mgr.entity_count(), 1);
         let e = &mgr.entities[0];
-        assert_eq!(e.mob_type, MobType::Zombie);
-        assert_eq!(e.health, 20.0);
-        assert_eq!(e.max_health, 20.0);
+        assert_eq!(e.mob_type, MobType::Sentinel);
+        assert_eq!(e.health, 30.0);
+        assert_eq!(e.max_health, 30.0);
         assert_eq!(e.behavior, MobBehavior::Hostile);
         assert!(e.alive);
     }
@@ -1321,30 +1386,35 @@ mod tests {
     #[test]
     fn mob_property_table_correct() {
         // (health, damage, speed, aggro_range, behavior)
-        assert_eq!(mob_properties(MobType::Zombie).0, 20.0);
-        assert_eq!(mob_properties(MobType::Skeleton).0, 20.0);
-        assert_eq!(mob_properties(MobType::Spider).0, 16.0);
-        assert_eq!(mob_properties(MobType::Sheep).0, 8.0);
-        assert_eq!(mob_properties(MobType::Chicken).0, 4.0);
+        assert_eq!(mob_properties(MobType::Sentinel).0, 30.0);
+        assert_eq!(mob_properties(MobType::Stalker).0, 16.0);
+        assert_eq!(mob_properties(MobType::Grazer).0, 12.0);
+        assert_eq!(mob_properties(MobType::Skitterling).0, 4.0);
+        assert_eq!(mob_properties(MobType::Ringkin).0, 16.0);
 
-        // Passive mobs deal no damage
-        assert_eq!(mob_properties(MobType::Sheep).1, 0.0);
+        // Passive mobs (fauna + natives) deal no damage
+        assert_eq!(mob_properties(MobType::Grazer).1, 0.0);
+        assert_eq!(mob_properties(MobType::Ringkin).1, 0.0);
         // Hostile mobs deal damage
-        assert!(mob_properties(MobType::Zombie).1 > 0.0);
+        assert!(mob_properties(MobType::Sentinel).1 > 0.0);
 
         // Behavior categories
-        assert_eq!(mob_properties(MobType::Cow).4, MobBehavior::Passive);
-        assert_eq!(mob_properties(MobType::Skeleton).4, MobBehavior::Hostile);
+        assert_eq!(mob_properties(MobType::Floater).4, MobBehavior::Passive);
+        assert_eq!(mob_properties(MobType::Stalker).4, MobBehavior::Hostile);
+
+        // Only the Floater hovers
+        assert!(MobType::Floater.hovers());
+        assert!(!MobType::Sentinel.hovers());
     }
 
     #[test]
     fn spawn_respects_max_entities() {
         let mut mgr = EntityManager::new();
         mgr.max_entities = 2;
-        assert_ne!(mgr.spawn_entity(MobType::Sheep, test_pos()), 0);
-        assert_ne!(mgr.spawn_entity(MobType::Sheep, test_pos()), 0);
+        assert_ne!(mgr.spawn_entity(MobType::Grazer, test_pos()), 0);
+        assert_ne!(mgr.spawn_entity(MobType::Grazer, test_pos()), 0);
         // Third spawn should fail (returns 0)
-        assert_eq!(mgr.spawn_entity(MobType::Sheep, test_pos()), 0);
+        assert_eq!(mgr.spawn_entity(MobType::Grazer, test_pos()), 0);
         assert_eq!(mgr.entity_count(), 2);
     }
 
@@ -1352,11 +1422,11 @@ mod tests {
     fn damage_entity_reduces_health() {
         let config = RingWorldConfig::default();
         let mut mgr = EntityManager::new();
-        let id = mgr.spawn_entity(MobType::Zombie, test_pos());
+        let id = mgr.spawn_entity(MobType::Sentinel, test_pos());
         let knockback = RingPosition::new(0.9, 0.0, 30.0);
         assert!(mgr.damage_entity(id, 5.0, &knockback, &config));
         let e = mgr.entities.iter().find(|e| e.id == id).unwrap();
-        assert_eq!(e.health, 15.0);
+        assert_eq!(e.health, 25.0);
         assert!(e.alive);
     }
 
@@ -1364,9 +1434,9 @@ mod tests {
     fn damage_entity_kills_at_zero() {
         let config = RingWorldConfig::default();
         let mut mgr = EntityManager::new();
-        let id = mgr.spawn_entity(MobType::Chicken, test_pos());
+        let id = mgr.spawn_entity(MobType::Skitterling, test_pos());
         let knockback = RingPosition::new(0.9, 0.0, 30.0);
-        // Chicken has 4 health
+        // Skitterling has 4 health
         assert!(mgr.damage_entity(id, 100.0, &knockback, &config));
         let e = mgr.entities.iter().find(|e| e.id == id).unwrap();
         assert!(!e.alive);
@@ -1410,9 +1480,9 @@ mod tests {
 
     #[test]
     fn entity_drop_items_correct() {
-        let e = Entity::new(1, MobType::Spider, test_pos());
+        let e = Entity::new(1, MobType::Stalker, test_pos());
         assert_eq!(e.drop_item(), VoxelType::Vine);
-        let z = Entity::new(2, MobType::Zombie, test_pos());
-        assert_eq!(z.drop_item(), VoxelType::IronOre);
+        let z = Entity::new(2, MobType::Sentinel, test_pos());
+        assert_eq!(z.drop_item(), VoxelType::IronIngot);
     }
 }

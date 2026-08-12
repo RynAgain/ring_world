@@ -1173,6 +1173,7 @@ impl State {
             &mut self.player.inventory,
             self.shadow_squares
                 .daylight_at(self.player.ring_position.theta),
+            &self.terrain_generator,
         );
 
         // Rebuild the entity render mesh (world-space boxes, identity model).
