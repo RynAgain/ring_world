@@ -606,3 +606,36 @@ Tests: 222 total (191 ring_world + 31 block_gallery), all passing.
 
 Tests: 225 total (194 ring_world + 31 block_gallery), all passing.
 
+## 2026-08-12 Batch 5: Sci-Fi Mob Roster (de-Minecrafting pass 1)
+
+Minecraft's Sheep/Cow/Pig/Chicken/Zombie/Skeleton/Spider are gone. The ring
+now has its own ecology, wired to the world's actual structures:
+
+| Mob | Family | Behavior |
+|---|---|---|
+| Grazer | Native fauna | Six-legged tan herbivore; daylight, grass |
+| Skitterling | Native fauna | Small fast scuttler; harmless |
+| Floater | Native fauna | Bioluminescent gasbag; HOVERS ~2 blocks up with a gentle bob, trailing tendrils |
+| Ringkin | Ring natives | Robed teal humanoids; spawn around the villages they build (daylight) |
+| Sentinel | Machine | Tall gunmetal mech, glowing red eye-bar; GUARDS facilities (ruins, sun tower) day AND night, rare night patrols elsewhere |
+| Stalker | Predator | Low six-legged nocturnal hunter |
+
+- **Spawn ecology**: `try_spawn` queries deterministic structure placement
+  (`village_center_near` / `facility_center_near` mirror the generation
+  hashing) so Sentinels actually stand guard at installations and Ringkin
+  live near their villages. Facility guard radius 28 blocks, village radius
+  48.
+- **Hover physics**: `MobType::hovers()` bypasses gravity; Floaters ease
+  toward ground + 2 blocks with a per-individual sine bob.
+- **Structure density fix**: villages were 1/64 per 64-chunk cell, a ~6%
+  chance of ANY village per ring (seed 42 had zero, ever). Now 1/2 per cell
+  (~2-3 villages/ring); ruins 1/3 per cell. Query + generator share the same
+  hash lines with MUST-match comments. New test asserts >=1 village and >=2
+  facilities on the default seed.
+- Drops: Sentinel salvages into IronIngot, Floater drops a Torch
+  (bioluminescent core), Grazer Leaves, Skitterling Flower, Stalker Vine,
+  Ringkin Plank.
+- world.save deleted (worldgen changed).
+
+Tests: 226 total (195 ring_world + 31 block_gallery), all passing.
+

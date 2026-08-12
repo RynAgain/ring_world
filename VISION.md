@@ -81,6 +81,17 @@ structure, arch coloring driven by segment repair state.
 
 ## Roadmap
 
+### De-Minecrafting checklist
+The knockoff feel comes from borrowed NOUNS. Replace them one system at a
+time; mechanics can stay familiar if the fiction is ours.
+- [x] Mobs: ring ecology (fauna / Ringkin natives / Sentinel machines)
+- [ ] Blocks & materials: rename/reskin toward megastructure fiction
+      (hull-metal, conduit, biomass) where it makes sense
+- [ ] Tools/crafting: fabricator language instead of crafting-table language
+- [ ] Structures: ruins -> ancient maintenance installations with Sentinel
+      garrisons; villages -> Ringkin settlements with distinct architecture
+- [ ] UI copy pass: no "mine", "mobs", "XP" wording on screen
+
 ### Near (polish the feel)
 - [x] Mob models: composite box bodies (head/body/legs), facing, walk swing
 - [x] Mob movement: feet-level collision + real step-up hops (no more
