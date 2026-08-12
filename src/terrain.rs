@@ -160,9 +160,16 @@ impl TerrainGenerator {
 
     /// The combined biome-selection scalar. Biome thresholds and the height
     /// blend both read this same value so they can never disagree.
+    /// NOTE on frequencies: noise is sampled on a circle of radius
+    /// radius*0.01 (~6.5 units), so the EFFECTIVE sampling circle for a
+    /// frequency f has radius 6.5*f. The original flat-world frequencies
+    /// (0.03/0.05) collapsed that circle to ~0.2 units — the whole ring fit
+    /// inside a fraction of one Perlin cell, the scalar was near-constant,
+    /// and every biome came out Plains. Frequencies here are tuned for the
+    /// wrapped domain: ~10 macro biome regions around the ring.
     fn biome_scalar(&self, noise_x: f64, noise_z: f64) -> f64 {
-        let biome_val = self.get2(&self.biome_noise, noise_x, noise_z, 0.03);
-        let biome_detail = self.get2(&self.biome_detail_noise, noise_x, noise_z, 0.05);
+        let biome_val = self.get2(&self.biome_noise, noise_x, noise_z, 0.28);
+        let biome_detail = self.get2(&self.biome_detail_noise, noise_x, noise_z, 0.9);
         biome_val * 0.7 + biome_detail * 0.3
     }
 
@@ -187,7 +194,7 @@ impl TerrainGenerator {
 
     /// Get terrain height based on biome
     fn biome_terrain_height(&self, noise_x: f64, noise_z: f64, biome: Biome) -> f64 {
-        let hills = self.get2(&self.terrain_noise, noise_x, noise_z, 0.1) * 0.5 + 0.5;
+        let hills = self.get2(&self.terrain_noise, noise_x, noise_z, 0.2) * 0.5 + 0.5;
         let bumps = self.get2(&self.detail_noise, noise_x, noise_z, 0.4) * 0.5 + 0.5;
         let detail = self.get2(&self.terrain_noise, noise_x, noise_z, 1.5) * 0.5 + 0.5;
 
@@ -261,7 +268,9 @@ impl TerrainGenerator {
             h
         };
 
-        height += self.get2(&self.continent_noise, noise_x, noise_z, 0.008) * 4.0;
+        // Wrapped-domain retune (see biome_scalar note): 0.008 was constant
+        // on the noise circle; 0.09 gives ~3-4 continental swells per ring.
+        height += self.get2(&self.continent_noise, noise_x, noise_z, 0.09) * 4.0;
         height.clamp(3.0, 62.0)
     }
 
@@ -270,8 +279,11 @@ impl TerrainGenerator {
         if biome != Biome::Plains && biome != Biome::Forest {
             return false;
         }
-        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.01);
-        river_val.abs() < 0.015
+        // Wrapped-domain retune: 0.01 was constant on the noise circle (zero
+        // rivers ever). 0.1 gives winding bands; the wider threshold keeps
+        // river width a few blocks at the steeper gradient.
+        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.1);
+        river_val.abs() < 0.04
     }
 
     /// Get river width factor (0.0 = not river, 1.0 = center of river)
@@ -279,10 +291,10 @@ impl TerrainGenerator {
         if biome != Biome::Plains && biome != Biome::Forest {
             return 0.0;
         }
-        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.01);
+        let river_val = self.get2(&self.river_noise, noise_x, noise_z, 0.1);
         let abs_val = river_val.abs();
-        if abs_val < 0.015 {
-            1.0 - (abs_val / 0.015)
+        if abs_val < 0.04 {
+            1.0 - (abs_val / 0.04)
         } else {
             0.0
         }
@@ -1108,6 +1120,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ring_has_real_biome_variety() {
+        // Regression for the "everything is Plains" bug: the wrapped noise
+        // circle collapsed at flat-world frequencies, making biome_scalar
+        // near-constant. Sample around the whole ring and require several
+        // distinct biomes and a wide scalar spread.
+        let config = RingWorldConfig::default();
+        let terrain = TerrainGenerator::new(42);
+        let mut seen = std::collections::HashSet::new();
+        let mut min_s = f64::MAX;
+        let mut max_s = f64::MIN;
+        for i in 0..512 {
+            let theta = i as f64 / 512.0 * std::f64::consts::TAU;
+            let nx = theta * config.radius * 0.01;
+            for nz in [-0.2f64, 0.0, 0.2] {
+                seen.insert(terrain.sample_biome(nx, nz).name());
+                let s = terrain.biome_scalar(nx, nz);
+                min_s = min_s.min(s);
+                max_s = max_s.max(s);
+            }
+        }
+        assert!(
+            seen.len() >= 4,
+            "only {} biomes around the ring: {:?}",
+            seen.len(),
+            seen
+        );
+        assert!(
+            max_s - min_s > 0.7,
+            "biome scalar spread too small: {}",
+            max_s - min_s
+        );
     }
 
     #[test]
