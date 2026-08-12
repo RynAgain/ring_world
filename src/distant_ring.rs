@@ -145,7 +145,11 @@ pub fn build_inner_surface(
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    let half_width = config.width;
+    // Half the axial width: vertex y must span [-width/2, +width/2] exactly
+    // like real chunk coordinates (ChunkCoord::to_ring_position starts at
+    // -width/2). Using the full width here shifted the whole arch by half
+    // the world width so its relief/colors didn't line up with the terrain.
+    let half_width = config.width / 2.0;
     let default_tex_index = TEX_GRASS_TOP;
 
     // Visible surface height at (theta, y): terrain height, but never below
@@ -279,7 +283,14 @@ mod tests {
         }
 
         // Every vertex radius must be displaced by a plausible terrain
-        // height: between sea level and the world height cap.
+        // height: between sea level and the world height cap. Vertex y must
+        // span the world's true axial extent [-width/2, +width/2] (an offset
+        // here = arch visibly misaligned with the terrain under your feet).
+        let half_w = config.width / 2.0;
+        let min_y = verts.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
+        let max_y = verts.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
+        assert!((min_y as f64 + half_w).abs() < 1e-3, "min y {} != -width/2", min_y);
+        assert!((max_y as f64 - half_w).abs() < 1e-3, "max y {} != +width/2", max_y);
         for v in verts.iter() {
             let rad = (v.position[0] as f64).hypot(v.position[2] as f64);
             let h = config.radius - rad;
