@@ -64,6 +64,8 @@ pub struct Entity {
     /// Walk-cycle phase in radians, advanced by distance walked; drives the
     /// limb swing in build_entity_mesh.
     pub walk_phase: f64,
+    /// Seconds remaining of the red damage flash (set on hit, decays).
+    pub hurt_timer: f32,
 }
 
 impl Entity {
@@ -91,6 +93,7 @@ impl Entity {
             vertical_velocity: 0.0,
             facing: 0.0,
             walk_phase: 0.0,
+            hurt_timer: 0.0,
         }
     }
 
@@ -208,6 +211,10 @@ impl EntityManager {
 
             if entity.attack_timer > 0.0 {
                 entity.attack_timer -= dt;
+            }
+
+            if entity.hurt_timer > 0.0 {
+                entity.hurt_timer -= dt;
             }
 
             if entity.flee_timer > 0.0 {
@@ -334,6 +341,7 @@ impl EntityManager {
     pub fn damage_entity(&mut self, id: u64, amount: f32, knockback_from: &RingPosition, config: &RingWorldConfig) -> bool {
         if let Some(entity) = self.entities.iter_mut().find(|e| e.id == id && e.alive) {
             entity.health -= amount;
+            entity.hurt_timer = HURT_FLASH_SECS;
             if entity.health <= 0.0 {
                 entity.alive = false;
             } else {
@@ -549,6 +557,9 @@ fn update_hostile_ai(
     }
 }
 
+/// Duration of the red damage flash on a hit mob, in seconds.
+const HURT_FLASH_SECS: f32 = 0.35;
+
 /// Speed of the hop a mob uses to climb a 1-block step
 /// (apex = v^2 / (2 g) = 6.8^2 / 40 = ~1.16 blocks).
 const STEP_JUMP_SPEED: f64 = 6.8;
@@ -661,7 +672,11 @@ fn apply_gravity(
     );
 
     if entity.vertical_velocity <= 0.0 && is_position_solid_entity(&ground_check, config, chunk_manager) {
-        let block_top = feet_height.floor() + 1.0;
+        // Snap to the top of the block the ground probe actually HIT (at
+        // feet - 0.05), not floor(feet)+1: when standing, feet sit exactly
+        // on an integer (12.0) and floor(12.0)+1 = 13 teleported the mob up
+        // a block every other frame — the "mobs oscillate up and down" bug.
+        let block_top = (feet_height - 0.05).floor() + 1.0;
         entity.position.height = block_top + entity.mob_height() * 0.5;
         entity.vertical_velocity = 0.0;
         entity.is_grounded = true;
@@ -935,9 +950,18 @@ pub fn build_entity_mesh(
             entity.facing,
             config,
         );
+        // Red damage flash: blend the body color toward red while the hurt
+        // timer runs, strongest at the moment of the hit.
+        let mut color = entity.render_color();
+        if entity.hurt_timer > 0.0 {
+            let f = (entity.hurt_timer / HURT_FLASH_SECS).clamp(0.0, 1.0) * 0.8;
+            color[0] = color[0] + (1.0 - color[0]) * f;
+            color[1] *= 1.0 - f;
+            color[2] *= 1.0 - f;
+        }
         emit_parts(
             &mob_parts(entity.mob_type),
-            entity.render_color(),
+            color,
             feet,
             fwd,
             side,
@@ -1180,6 +1204,78 @@ mod tests {
             "mob should have crossed the step, theta {}",
             e.position.theta
         );
+    }
+
+    #[test]
+    fn damaged_mobs_flash_red_in_the_mesh() {
+        let config = crate::ring_world::RingWorldConfig::default();
+        let mut mgr = super::EntityManager::new();
+        let pos = crate::ring_world::RingPosition::new(1.0, 0.0, 30.0);
+        let id = mgr.spawn_entity(super::MobType::Cow, pos);
+
+        let (verts_before, _) = super::build_entity_mesh(&mgr.entities, &config);
+        let knockback = crate::ring_world::RingPosition::new(0.9, 0.0, 30.0);
+        assert!(mgr.damage_entity(id, 2.0, &knockback, &config));
+        assert!(mgr.entities[0].hurt_timer > 0.0);
+        let (verts_after, _) = super::build_entity_mesh(&mgr.entities, &config);
+
+        // Same geometry, redder color: red channel up, green down.
+        assert_eq!(verts_before.len(), verts_after.len());
+        assert!(verts_after[0].color[0] > verts_before[0].color[0]);
+        assert!(verts_after[0].color[1] < verts_before[0].color[1]);
+    }
+
+    #[test]
+    fn standing_mob_height_is_rock_stable() {
+        // Regression: the landing snap used floor(feet)+1, which re-read feet
+        // sitting exactly on an integer as "inside the NEXT block up" and
+        // teleported the mob up a block every other frame (visible as mobs
+        // endlessly oscillating up and down). A mob standing still on flat
+        // ground must keep a bit-stable height across hundreds of frames.
+        use crate::chunk::{Chunk, ChunkManager};
+        use crate::voxel::{Voxel, VoxelType};
+
+        let config = crate::ring_world::RingWorldConfig::default();
+        let size = config.chunk_size;
+        let coord = crate::ring_world::ChunkCoord::new(0, 0, 0);
+        let mut chunk = Chunk::new(coord, size);
+        for lx in 0..size {
+            for lz in 0..size {
+                chunk.set_voxel(lx, 10, lz, Voxel::new(VoxelType::Stone));
+            }
+        }
+        let mut mgr = ChunkManager::new(config.clone(), 2);
+        mgr.chunks.insert(coord, chunk);
+
+        let block_theta = config.chunk_angular_size() / size as f64;
+        let y0 = -config.width / 2.0 + 8.5;
+        let mut e = super::Entity::new(
+            1,
+            super::MobType::Sheep,
+            crate::ring_world::RingPosition::new(8.0 * block_theta, y0, 13.0),
+        );
+
+        // Let it land first.
+        for _ in 0..60 {
+            super::apply_gravity(&mut e, 0.05, &config, &mgr);
+        }
+        let settled = e.position.height;
+        let expected = 11.0 + e.mob_height() * 0.5; // stone top at 11
+        assert!(
+            (settled - expected).abs() < 1e-9,
+            "settled at {} expected {}",
+            settled,
+            expected
+        );
+        for i in 0..400 {
+            super::apply_gravity(&mut e, 0.05, &config, &mgr);
+            assert!(
+                (e.position.height - settled).abs() < 1e-9,
+                "height drifted to {} at frame {}",
+                e.position.height,
+                i
+            );
+        }
     }
 
     #[test]
