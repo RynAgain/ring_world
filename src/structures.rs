@@ -52,6 +52,99 @@ impl StructureGenerator {
         self.generate_villages(chunk, config, terrain);
     }
 
+    /// Deterministic query: the center (world blocks x, z) of a village
+    /// within `radius` blocks of the given position, if any. Mirrors
+    /// generate_villages' cell hashing exactly, so entity spawning can put
+    /// Ringkin natives around the villages they build without scanning
+    /// chunks. Ring-wrapped on x.
+    pub fn village_center_near(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        config: &RingWorldConfig,
+        terrain: &TerrainGenerator,
+        radius: i32,
+    ) -> Option<(i32, i32)> {
+        let cs = config.chunk_size as i32;
+        let circ_blocks = config.chunks_circumference as i32 * cs;
+        let cell_size = 64i32;
+        let n_cells = (config.chunks_circumference as i32 + cell_size - 1) / cell_size;
+        for ci in 0..n_cells {
+            let cell = ci * cell_size;
+            let ch = Self::hash(cell, 2, self.seed.wrapping_add(4000));
+            if ch % 2 != 0 { continue; } // MUST match generate_villages
+            let ph = Self::hash3(cell, 2, 1, self.seed.wrapping_add(4001));
+            let vr = (cell + (ph % cell_size as u32) as i32)
+                .rem_euclid(config.chunks_circumference as i32);
+            let wh = Self::hash3(cell, 2, 2, self.seed.wrapping_add(4002));
+            let vw = 3 + (wh % (config.chunks_width - 6) as u32) as i32;
+            let vx = vr * cs + cs / 2;
+            let vz = vw * cs + cs / 2;
+            let nx = self.world_to_noise_x(vx, config);
+            let nz = self.world_to_noise_z(vz, config);
+            if terrain.sample_biome(nx, nz) != Biome::Plains { continue; }
+            if terrain.sample_terrain_height(nx, nz, config) as i32 <= SEA_LEVEL as i32 { continue; }
+            let dxr = (world_x - vx).rem_euclid(circ_blocks);
+            let dx = dxr.min(circ_blocks - dxr);
+            if dx <= radius && (world_z - vz).abs() <= radius {
+                return Some((vx, vz));
+            }
+        }
+        None
+    }
+
+    /// Deterministic query: the center of a surface FACILITY (ancient ruin
+    /// or the sun tower) within `radius` blocks. Sentinel machines guard
+    /// these installations day and night. Mirrors generate_ruins /
+    /// generate_sun_tower placement hashing exactly.
+    pub fn facility_center_near(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        config: &RingWorldConfig,
+        terrain: &TerrainGenerator,
+        radius: i32,
+    ) -> Option<(i32, i32)> {
+        let cs = config.chunk_size as i32;
+        let circ_blocks = config.chunks_circumference as i32 * cs;
+        let wrapped_close = |x: i32, cx: i32, z: i32, cz: i32| -> bool {
+            let dxr = (x - cx).rem_euclid(circ_blocks);
+            let dx = dxr.min(circ_blocks - dxr);
+            dx <= radius && (z - cz).abs() <= radius
+        };
+
+        // Sun tower (fixed installation).
+        let tower_cx = 8i32;
+        let tower_cz = (config.chunks_width * config.chunk_size / 2) as i32;
+        if wrapped_close(world_x, tower_cx, world_z, tower_cz) {
+            return Some((tower_cx, tower_cz));
+        }
+
+        // Ruins (cell hashing mirror of generate_ruins).
+        let cell_size = 32i32;
+        let n_cells = (config.chunks_circumference as i32 + cell_size - 1) / cell_size;
+        for ci in 0..n_cells {
+            let cell = ci * cell_size;
+            let ch = Self::hash(cell, 1, self.seed.wrapping_add(3000));
+            if ch % 3 != 0 { continue; } // MUST match generate_ruins
+            let ph = Self::hash3(cell, 1, 1, self.seed.wrapping_add(3001));
+            let rr = (cell + (ph % cell_size as u32) as i32)
+                .rem_euclid(config.chunks_circumference as i32);
+            let wh = Self::hash3(cell, 1, 2, self.seed.wrapping_add(3002));
+            let rw = 2 + (wh % (config.chunks_width - 4) as u32) as i32;
+            let rx = rr * cs + cs / 2;
+            let rz = rw * cs + cs / 2;
+            let nx = self.world_to_noise_x(rx, config);
+            let nz = self.world_to_noise_z(rz, config);
+            if terrain.sample_biome(nx, nz) == Biome::Ocean { continue; }
+            if terrain.sample_terrain_height(nx, nz, config) as i32 <= SEA_LEVEL as i32 { continue; }
+            if wrapped_close(world_x, rx, world_z, rz) {
+                return Some((rx, rz));
+            }
+        }
+        None
+    }
+
     /// Force-place a block at world coords if within this chunk (overwrites anything)
     fn force_block_in_chunk(&self, chunk: &mut Chunk, world_x: i32, world_z: i32, world_y: i32, vt: VoxelType) {
         let cs = chunk.size() as i32;
@@ -276,7 +369,8 @@ impl StructureGenerator {
         for cell_offset in -1..=1 {
             let cell = (cell_start + cell_offset * cell_size).rem_euclid(config.chunks_circumference as i32);
             let ch = Self::hash(cell, 1, self.seed.wrapping_add(3000));
-            if ch % 32 != 0 { continue; }
+            // 1/3 per 32-chunk cell (~2-3 ruins/ring; was ~25% per ring).
+            if ch % 3 != 0 { continue; }
 
             let ph = Self::hash3(cell, 1, 1, self.seed.wrapping_add(3001));
             let rr = (cell + (ph % cell_size as u32) as i32).rem_euclid(config.chunks_circumference as i32);
@@ -368,7 +462,9 @@ impl StructureGenerator {
         for cell_offset in -1..=1 {
             let cell = (cell_start + cell_offset * cell_size).rem_euclid(config.chunks_circumference as i32);
             let ch = Self::hash(cell, 2, self.seed.wrapping_add(4000));
-            if ch % 64 != 0 { continue; }
+            // 1/2 per 64-chunk cell (~2-3 villages/ring). The old 1/64 made
+            // villages a ~6% chance PER RING (seed 42 had zero, ever).
+            if ch % 2 != 0 { continue; }
 
             let ph = Self::hash3(cell, 2, 1, self.seed.wrapping_add(4001));
             let vr = (cell + (ph % cell_size as u32) as i32).rem_euclid(config.chunks_circumference as i32);

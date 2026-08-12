@@ -1007,6 +1007,32 @@ impl TerrainGenerator {
         self.get2(&self.vegetation_noise, noise_x, noise_z, 0.8)
     }
 
+    /// Spawn-ecology query: village center within `radius` blocks (Ringkin
+    /// natives live around the villages they build).
+    pub fn village_center_near(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        config: &RingWorldConfig,
+        radius: i32,
+    ) -> Option<(i32, i32)> {
+        self.structure_generator
+            .village_center_near(world_x, world_z, config, self, radius)
+    }
+
+    /// Spawn-ecology query: facility (ruin / sun tower) center within
+    /// `radius` blocks (Sentinel machines guard these).
+    pub fn facility_center_near(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        config: &RingWorldConfig,
+        radius: i32,
+    ) -> Option<(i32, i32)> {
+        self.structure_generator
+            .facility_center_near(world_x, world_z, config, self, radius)
+    }
+
     /// Convert local chunk voxel position to world ring coordinates (theta, y)
     fn local_to_world(
         &self,
@@ -1153,6 +1179,39 @@ mod tests {
             max_s - min_s > 0.7,
             "biome scalar spread too small: {}",
             max_s - min_s
+        );
+    }
+
+    #[test]
+    fn ring_has_villages_and_facilities() {
+        // The spawn ecology needs real settlements and installations: at
+        // least one village (Ringkin) and two facilities (tower + >=1 ruin;
+        // Sentinels) must exist on the default-seed ring. Guards against the
+        // old 1/64-per-cell density where seed 42 had ZERO villages ever.
+        let config = RingWorldConfig::default();
+        let terrain = TerrainGenerator::new(42);
+        let circ_blocks = (config.chunks_circumference * config.chunk_size) as i32;
+        let width_blocks = (config.chunks_width * config.chunk_size) as i32;
+        let mut villages = std::collections::HashSet::new();
+        let mut facilities = std::collections::HashSet::new();
+        for wx in (0..circ_blocks).step_by(16) {
+            for wz in (0..width_blocks).step_by(16) {
+                if let Some(c) = terrain.village_center_near(wx, wz, &config, 24) {
+                    villages.insert(c);
+                }
+                if let Some(c) = terrain.facility_center_near(wx, wz, &config, 24) {
+                    facilities.insert(c);
+                }
+            }
+        }
+        assert!(
+            !villages.is_empty(),
+            "no villages on the ring — the Ringkin have nowhere to live"
+        );
+        assert!(
+            facilities.len() >= 2,
+            "expected sun tower + at least one ruin, got {:?}",
+            facilities
         );
     }
 
