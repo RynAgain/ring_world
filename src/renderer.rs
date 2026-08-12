@@ -4,6 +4,10 @@ use std::collections::HashMap;
 
 /// Seconds between periodic world autosaves.
 const AUTOSAVE_INTERVAL_SECS: f32 = 60.0;
+/// Max chunks terrain-generated per frame (streaming budget; closest first).
+const GEN_BUDGET_PER_FRAME: usize = 24;
+/// Max chunk meshes rebuilt + uploaded per frame (closest first).
+const MESH_BUDGET_PER_FRAME: usize = 10;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -1289,13 +1293,19 @@ impl State {
         }
 
         // ---- Determine which chunks are dirty and need a mesh rebuild ----
-        let dirty_coords: Vec<ChunkCoord> = self
+        // Frame budget, closest first: meshing (greedy merge + curvature bake
+        // + GPU upload) is the expensive half of the chunk-load hitch. Player
+        // block edits are always distance 0 so they re-mesh the same frame.
+        let mut dirty_coords: Vec<ChunkCoord> = self
             .chunk_manager
             .chunks
             .iter()
             .filter(|(_, chunk)| chunk.dirty && chunk.generated)
             .map(|(coord, _)| *coord)
             .collect();
+        let player_pos_for_budget = self.player.ring_position;
+        dirty_coords.sort_by_key(|c| self.chunk_manager.chunk_distance(c, &player_pos_for_budget));
+        dirty_coords.truncate(MESH_BUDGET_PER_FRAME);
 
         // Recompute lighting for dirty chunks before mesh generation (sequential,
         // since it only touches the single chunk and is cheap).
@@ -1490,7 +1500,7 @@ impl State {
     /// Generate terrain + lighting for any loaded-but-ungenerated chunks, using
     /// rayon to parallelise across chunks. (Task 5: Multithreaded chunk generation.)
     fn generate_pending_chunks(&mut self) {
-        let ungenerated: Vec<ChunkCoord> = self
+        let mut ungenerated: Vec<ChunkCoord> = self
             .chunk_manager
             .chunks
             .iter()
@@ -1501,6 +1511,14 @@ impl State {
         if ungenerated.is_empty() {
             return;
         }
+
+        // Frame budget: crossing a chunk boundary enqueues a whole wall of
+        // new chunks (17 x 4+ with render distance 8); generating them all in
+        // one frame is the "short freeze on chunk load" hitch. Generate the
+        // closest N per frame and let the rest stream in over later frames.
+        let player_pos = self.player.ring_position;
+        ungenerated.sort_by_key(|c| self.chunk_manager.chunk_distance(c, &player_pos));
+        ungenerated.truncate(GEN_BUDGET_PER_FRAME);
 
         // Move the chunks out of the manager so we can mutate them off-thread.
         let mut to_generate: Vec<Chunk> = Vec::with_capacity(ungenerated.len());
